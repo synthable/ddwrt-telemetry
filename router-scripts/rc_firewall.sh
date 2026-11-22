@@ -125,6 +125,25 @@ ensure_rule_before_terminal() {
   fi
 }
 
+clear_saved_stock_logs_for_chain() {
+  CHAIN_ARG="$1"
+  [ -f "$BACKUP_FILE" ] || return 0
+  TMP_BKP="${BACKUP_FILE}.tmp.$$"
+  awk -F'|' -v c="$CHAIN_ARG" '$1 != c { print $0 }' "$BACKUP_FILE" > "$TMP_BKP" 2>/dev/null && \
+    mv -f "$TMP_BKP" "$BACKUP_FILE" || rm -f "$TMP_BKP"
+}
+
+has_saved_stock_log_kind() {
+  CHAIN_ARG="$1"
+  KIND_ARG="$2"
+  PFX_ARG="$3"
+  [ -f "$BACKUP_FILE" ] || return 1
+  awk -F'|' -v c="$CHAIN_ARG" -v k="$KIND_ARG" -v p="$PFX_ARG" '
+    $1 == c && $3 == k && $4 == p { found = 1; exit }
+    END { exit(found ? 0 : 1) }
+  ' "$BACKUP_FILE"
+}
+
 record_stock_log_backup() {
   CHAIN_ARG="$1"
   ORIG_POS_ARG="$2"
@@ -160,6 +179,11 @@ remove_stock_log_rules() {
     [ -n "$FOUND" ] || break
     N=${FOUND%%|*}
     KIND=${FOUND#*|}
+    # If this stock rule kind is already recorded in BACKUP_FILE, the chain was rebuilt by DD-WRT
+    # since the last run; clear stale entries for this chain before recording fresh positions.
+    if has_saved_stock_log_kind "$CHAIN" "$KIND" "$PFX"; then
+      clear_saved_stock_logs_for_chain "$CHAIN"
+    fi
     PRIOR=$(count_saved_stock_logs_for_chain "$CHAIN")
     ORIG_POS=$((N + PRIOR))
     "$IPTABLES_BIN" -D "$CHAIN" "$N" || return 1
@@ -183,6 +207,9 @@ insert_rule_at_pos() {
   CHAIN="$1"
   POS="$2"
   shift 2
+  if "$IPTABLES_BIN" -C "$CHAIN" "$@" 2>/dev/null; then
+    return 0
+  fi
   MAX_POS=$(( $(chain_rule_count "$CHAIN") + 1 ))
   if [ "$POS" -lt 1 ] 2>/dev/null; then
     POS=1
@@ -260,19 +287,26 @@ fi
 
 # Apply NFLOG rules in-place without flushing chains or removing custom/terminal rules,
 # then record and remove unfiltered stock DD-WRT LOG rules so dmesg/syslog stays clean.
+# If a chain lacks our telemetry NFLOG rule at entry, DD-WRT rebuilt the chain (or this is
+# a fresh install), so clear any stale saved stock LOG entries for that chain first.
+[ -z "$(find_nflog_line logaccept 1 "ACCEPT ")" ] && clear_saved_stock_logs_for_chain logaccept
 ensure_rule_before_terminal logaccept -m state --state NEW -j NFLOG --nflog-group 1 --nflog-prefix "ACCEPT " || exit 1
 remove_stock_log_rules logaccept "ACCEPT " || exit 1
 
+[ -z "$(find_nflog_line logdrop 2 "DROP ")" ] && clear_saved_stock_logs_for_chain logdrop
 ensure_rule_before_terminal logdrop -m state --state NEW -j NFLOG --nflog-group 2 --nflog-prefix "DROP " || exit 1
 ensure_rule_before_terminal logdrop -m state --state INVALID -j NFLOG --nflog-group 2 --nflog-prefix "DROP " || exit 1
 remove_stock_log_rules logdrop "DROP " || exit 1
 
+[ -z "$(find_nflog_line logreject 2 "REJECT ")" ] && clear_saved_stock_logs_for_chain logreject
 ensure_rule_before_terminal logreject -j NFLOG --nflog-group 2 --nflog-prefix "REJECT " || exit 1
 remove_stock_log_rules logreject "REJECT " || exit 1
 
+[ -z "$(find_nflog_line logreject_tcp 2 "REJECT ")" ] && clear_saved_stock_logs_for_chain logreject_tcp
 ensure_rule_before_terminal logreject_tcp -j NFLOG --nflog-group 2 --nflog-prefix "REJECT " || exit 1
 remove_stock_log_rules logreject_tcp "REJECT " || exit 1
 
+[ -z "$(find_nflog_line portscan 2 "portscan:")" ] && clear_saved_stock_logs_for_chain portscan
 ensure_rule_before_terminal portscan -j NFLOG --nflog-group 2 --nflog-prefix "portscan:" || exit 1
 remove_stock_log_rules portscan "portscan:" || exit 1
 

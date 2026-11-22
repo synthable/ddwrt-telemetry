@@ -358,6 +358,27 @@ orig = json.loads(open(sys.argv[2]).read())
 assert after == orig, f"Ordered rules after rollback differ from pre-install!\nAfter: {json.dumps(after, indent=2)}\nOrig:  {json.dumps(orig, indent=2)}"
 PYEOF
 
+# --- Test 4b: Rebuilt chains without reboot (retaining BACKUP_FILE) reconcile cleanly ---
+init_state
+IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
+  BACKUP_FILE="$BACKUP_FILE" SLEEP_SEC=0 SKIP_DAEMON=1 sh "$FW_SCRIPT"
+# Simulate DD-WRT rebuilding stock chains without rebooting (BACKUP_FILE remains in /tmp)
+SAVED_BKP=$(cat "$BACKUP_FILE")
+init_state
+printf '%s\n' "$SAVED_BKP" > "$BACKUP_FILE"
+# Re-run rc_firewall.sh after chain rebuild, then rollback
+IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
+  BACKUP_FILE="$BACKUP_FILE" SLEEP_SEC=0 SKIP_DAEMON=1 sh "$FW_SCRIPT"
+IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
+  BACKUP_FILE="$BACKUP_FILE" SLEEP_SEC=0 SKIP_DAEMON=1 sh "$FW_SCRIPT" rollback
+
+python3 - "$STATE_FILE" "$ORIG_CHAINS" <<'PYEOF'
+import json, sys
+after = json.loads(open(sys.argv[1]).read())["chains"]
+orig = json.loads(open(sys.argv[2]).read())
+assert after == orig, f"Ordered rules after chain rebuild + install + rollback differ from pre-install!\nAfter: {json.dumps(after, indent=2)}\nOrig:  {json.dumps(orig, indent=2)}"
+PYEOF
+
 # --- Test 5: Mid-run interruption preserves custom rules & positions, and rollback restores exact pre-install rules ---
 init_state
 if IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
