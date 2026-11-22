@@ -176,9 +176,13 @@ sequenceDiagram
 4. **Launch both local dashboards**:
    ```bash
    make run
-   # or with custom name / router API:
-   ./scripts/run-dashboards.sh --router-name "WRT1900ACv2" --api http://192.168.1.1:8789
+   # or with custom name / router API / local archive retention:
+   ./scripts/run-dashboards.sh --router-name "WRT1900ACv2" --api http://192.168.1.1:8789 --retain-days 30
    ```
+
+   **Local Archive Retention** (both dashboards):
+   - `--retain-days N` / `RETAIN_DAYS=N` (default: `30`, `0` disables): prunes managed local archives under `data/archives/` older than `N` days and skips re-downloading expired router archives.
+   - `--max-archives N` / `MAX_ARCHIVES=N` (default: `0` / unlimited): caps the number of newest managed local archives kept per log prefix (`dns`, `fw-drop`, `fw-accept`, `syslog`). Unrelated files in `data/archives/` are never deleted.
 
 ---
 

@@ -12,8 +12,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -150,8 +148,6 @@ func startFileTailer(path, kind string, b *broker, stop <-chan struct{}) {
 	}()
 }
 
-var validArchiveRe = regexp.MustCompile(`^(dns|fw-drop|fw-accept|syslog)-[0-9]{8}-[0-9]{6}\.log\.gz$`)
-
 type apiConfig struct {
 	ListenAddr string
 	Token      string
@@ -244,15 +240,7 @@ func startHTTPServer(cfg apiConfig) *http.Server {
 			iptOut += string(out2)
 		}
 
-		var archives []string
-		if entries, err := os.ReadDir(cfg.ArchiveDir); err == nil {
-			for _, e := range entries {
-				if !e.IsDir() && validArchiveRe.MatchString(e.Name()) {
-					archives = append(archives, e.Name())
-				}
-			}
-			sort.Strings(archives)
-		}
+		archives := listArchives(cfg.ArchiveDir)
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
