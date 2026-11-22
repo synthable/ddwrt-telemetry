@@ -1,20 +1,52 @@
 # DD-WRT Telemetry
 
+[![CI](https://github.com/synthable/ddwrt-telemetry/actions/workflows/ci.yml/badge.svg)](https://github.com/synthable/ddwrt-telemetry/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/synthable/ddwrt-telemetry?color=2563eb)](https://github.com/synthable/ddwrt-telemetry/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-2563eb.svg)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.22%2B-00ADD8?logo=go&logoColor=white)](nflogd/go.mod)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](dns-dashboard/server.py)
+[![Dependencies](https://img.shields.io/badge/Dependencies-Zero-10b981.svg)](#architecture)
+[![WCAG AA](https://img.shields.io/badge/Accessibility-WCAG%202.1%20AA-047857.svg)](DESIGN.md)
+
 Zero-dependency, real-time **DNS** and **Perimeter Firewall** dashboards for DD-WRT routers — powered by a lightweight Go `NFLOG` daemon (`nflogd`) that **completely bypasses `dmesg` and `/var/log/messages`** and streams live events over LAN Server-Sent Events (SSE).
 
-No Docker. No `npm`. No Entware or USB drive required. Pure Go stdlib + Python 3 stdlib + vanilla HTML/CSS/JS.
+No Docker. No `npm`. No Entware or USB drive required. Pure Go stdlib + Python 3 stdlib + vanilla HTML/CSS/JS with dark & light modes.
 
 ---
 
 ## Screenshots
 
 ### DNS Telemetry Dashboard (`:8787`)
-![DNS Telemetry Dashboard](docs/dns-dashboard.png)
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/dns-dashboard-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/dns-dashboard.png">
+  <img alt="DNS Telemetry Dashboard" src="docs/dns-dashboard.png">
+</picture>
 
 ### Perimeter Firewall Dashboard (`:8788`)
-![Perimeter Firewall Dashboard](docs/firewall-dashboard.png)
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="docs/firewall-dashboard-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/firewall-dashboard.png">
+  <img alt="Perimeter Firewall Dashboard" src="docs/firewall-dashboard.png">
+</picture>
 
-*(Captured in `--demo` mode with synthetic data.)*
+*(Captured in `--demo` mode with synthetic data. Both dashboards include a Dark/Light theme toggle and match GitHub's color scheme above.)*
+
+---
+
+## Try It Immediately (Demo Mode)
+
+No router required — launch **both** dashboards together with one command:
+
+```bash
+make demo
+```
+
+Then open:
+- **DNS Telemetry**: http://127.0.0.1:8787
+- **Perimeter Firewall**: http://127.0.0.1:8788
+
+Press `Ctrl+C` to stop both cleanly (or run individually via `make demo-dns` / `make demo-fw`).
 
 ---
 
@@ -88,31 +120,17 @@ sequenceDiagram
 
 ---
 
-## Try It Immediately (Demo Mode)
-
-No router required — spin up both dashboards with synthetic LAN + WAN telemetry:
-
-```bash
-# Terminal 1 — DNS Dashboard (http://127.0.0.1:8787)
-make demo-dns
-
-# Terminal 2 — Firewall Dashboard (http://127.0.0.1:8788)
-make demo-fw
-```
-
----
-
 ## Features
 
 ### DNS Telemetry Dashboard (`:8787`)
-- **Per-LAN-device matrix**: automatically resolves client IPs to hostnames from `/tmp/dnsmasq.conf` (`dhcp-host`) and `/jffs/dnsmasq.leases`. Click any device to isolate its queries, block rate, cache hit rate, top domains, and timeline.
-- **AdGuard Public DNS block detection**: separates null-routed `0.0.0.0` / `::` blocks from `Cached`, `Allowed`, and `NXDOMAIN` replies, with smart correlation across concurrent `A`, `AAAA`, `HTTPS`, and reverse `PTR` lookups.
-- **Interactive filtering**: time ranges (`15m`–`7d`, `All`), `Hide PTR` toggle, instant search, record-type chips, live SSE updates, and CSV export.
+- **Per-LAN-device matrix**: resolves client IPs to hostnames from `/tmp/dnsmasq.conf` (`dhcp-host`) and `/jffs/dnsmasq.leases`. Click any device to isolate its queries, block rate, cache hit rate, top domains, and timeline.
+- **AdGuard Public DNS block detection**: separates null-routed `0.0.0.0` / `::` blocks from `Cached`, `Allowed`, and `NXDOMAIN` replies, correlating concurrent `A`, `AAAA`, `HTTPS`, and reverse `PTR` lookups.
+- **Interactive filtering**: time ranges (`15m`–`7d`, `All`), `Hide PTR` toggle, instant search, record-type chips, live SSE updates, Dark/Light mode toggle, and CSV export.
 
 ### Perimeter Firewall Dashboard (`:8788`)
-- **Dual `Blocked` + `Allowed` views**: inspect both unsolicited WAN `DROP`/`REJECT`/`portscan` hits and `NEW` accepted outbound/LAN flows (with LAN device names!).
+- **Dual `Blocked` + `Allowed` views**: inspect both unsolicited WAN `DROP`/`REJECT`/`portscan` hits and `NEW` accepted outbound/LAN flows with resolved LAN device names.
 - **Automatic traffic classification + `Hide Stale Return` toggle**: separates genuine inbound probes (RDP `3389`, Memcached `11211`, SNMP `161`, SIP `5060`, IPMI `623`, raw GRE `47` / IP-in-IP `4`) and ICMP pings from harmless late QUIC (`UDP/443`) and TCP `RST` teardown noise.
-- **Live kernel `iptables` counters**: surfaces packet counts even for silent `DROP` rules (WAN SSH `:22`/`:2222`, `psd` port-scan drops, silent catch-all TCP drops).
+- **Live kernel `iptables` counters**: displays packet counts even for silent `DROP` rules (WAN SSH `:22`/`:2222`, `psd` port-scan drops, silent catch-all TCP drops).
 - **Exact deduplication** across overlapping live and archived logs, plus local archive persistence under `data/archives/`.
 
 ### `nflogd` Router Daemon
@@ -124,63 +142,53 @@ make demo-fw
 
 ## Router Installation (DD-WRT)
 
-### 1. Cross-compile `nflogd` for your router CPU
+### Option A: Automated Preflight & Deploy Script
 
 ```bash
-# Linksys WRT1900ACv2 / WRT3200ACM / ARMv7 routers
-make build-armv7
+# 1. Dry-run preflight (checks architecture, kernel nfnetlink_log, and /jffs space)
+./scripts/install-router.sh --router root@192.168.1.1 --ssh-port 2222 --ssh-key ~/.ssh/id_ed25519_router --dry-run
 
-# Or ARM64 / MIPS little-endian
-make build-arm64
-make build-mipsle
+# 2. Build (if needed), generate Bearer token, and deploy to /jffs
+./scripts/install-router.sh --router root@192.168.1.1 --ssh-port 2222 --ssh-key ~/.ssh/id_ed25519_router
 ```
 
-*(Requires Go 1.22+ on your build machine.)*
+*(The script never overwrites your existing `rc_startup` or `rc_firewall` NVRAM scripts — it uploads `/jffs/bin/nflogd`, `/jffs/etc/nflogd.token`, and `/jffs/scripts/archive-logs.sh`, then prints the hooks to merge.)*
 
-### 2. Generate a shared Bearer token
+### Option B: Manual Build & Deploy
 
-```bash
-mkdir -p ~/.ddwrt && chmod 700 ~/.ddwrt
-python3 -c "import os, secrets; p=os.path.expanduser('~/.ddwrt/nflogd.token'); open(p,'w').write(secrets.token_hex(32)+'\n'); os.chmod(p, 0o600)"
-```
+1. **Build `nflogd`** (or download a prebuilt binary from [GitHub Releases](../../releases)):
+   ```bash
+   make build-armv7   # Linksys WRT1900ACv2 / WRT3200ACM / ARMv7
+   # or: make build-arm64 | make build-mipsle
+   ```
+2. **Generate a shared Bearer token**:
+   ```bash
+   mkdir -p ~/.ddwrt && chmod 700 ~/.ddwrt
+   python3 -c "import os, secrets; p=os.path.expanduser('~/.ddwrt/nflogd.token'); open(p,'w').write(secrets.token_hex(32)+'\n'); os.chmod(p, 0o600)"
+   ```
+3. **Upload to `/jffs`** and merge the templates in [`router-scripts/`](router-scripts/):
+   - **Startup** (`rc_startup`): [`router-scripts/rc_startup.sh`](router-scripts/rc_startup.sh) (adjust `-tz` and `-http-listen` if needed)
+   - **Firewall** (`rc_firewall`): [`router-scripts/rc_firewall.sh`](router-scripts/rc_firewall.sh)
+   - **Shutdown** (`rc_shutdown`): `/jffs/scripts/archive-logs.sh >/dev/null 2>&1`
+   - **Additional Dnsmasq Options** (`dnsmasq_options`): [`router-scripts/dnsmasq_options.conf`](router-scripts/dnsmasq_options.conf)
+   - **Cron Jobs** (`cron_jobs`): [`router-scripts/cron_jobs.txt`](router-scripts/cron_jobs.txt)
+   - Set `log_accepted=0` in DD-WRT Security → Log so stock kernel `LOG` rules aren't emitted alongside `NFLOG`.
+4. **Launch both local dashboards**:
+   ```bash
+   make run
+   # or with custom name / router API:
+   ./scripts/run-dashboards.sh --router-name "WRT1900ACv2" --api http://192.168.1.1:8789
+   ```
 
-### 3. Deploy to `/jffs` on your router
+---
 
-```bash
-ROUTER="root@192.168.1.1"
-SSH_OPTS="-p 2222 -i ~/.ssh/id_ed25519_router"
+## Tested Hardware
 
-ssh $SSH_OPTS $ROUTER 'mkdir -p /jffs/bin /jffs/etc /jffs/scripts /jffs/logs && chmod 700 /jffs/etc'
-ssh $SSH_OPTS $ROUTER 'cat > /jffs/etc/nflogd.token && chmod 600 /jffs/etc/nflogd.token' < ~/.ddwrt/nflogd.token
-ssh $SSH_OPTS $ROUTER 'cat > /jffs/bin/nflogd && chmod 755 /jffs/bin/nflogd' < nflogd/dist/nflogd-armv7
-ssh $SSH_OPTS $ROUTER 'cat > /jffs/scripts/archive-logs.sh && chmod 755 /jffs/scripts/archive-logs.sh' < router-scripts/archive-logs.sh
-```
+| Router | Firmware | CPU Arch | Kernel | `nflogd` RSS | Status |
+| --- | --- | --- | --- | --- | --- |
+| Linksys WRT1900ACv2 | DD-WRT v3.0-r62036 std | `armv7l` | `6.1.147-rt28` | ~5.3 MB | Verified |
 
-### 4. Configure DD-WRT hooks
-
-Apply the templates in [`router-scripts/`](router-scripts/) via the DD-WRT web UI (or `nvram set` + `nvram commit`):
-- **Startup** (`rc_startup`): [`router-scripts/rc_startup.sh`](router-scripts/rc_startup.sh) (update `-tz` and `-http-listen` if needed)
-- **Firewall** (`rc_firewall`): [`router-scripts/rc_firewall.sh`](router-scripts/rc_firewall.sh)
-- **Shutdown** (`rc_shutdown`): `/jffs/scripts/archive-logs.sh >/dev/null 2>&1`
-- **Additional Dnsmasq Options** (`dnsmasq_options`): [`router-scripts/dnsmasq_options.conf`](router-scripts/dnsmasq_options.conf)
-- **Cron Jobs** (`cron_jobs`): [`router-scripts/cron_jobs.txt`](router-scripts/cron_jobs.txt)
-- Disable `log_accepted=0` in DD-WRT Security → Log so stock kernel `LOG` rules aren't emitted alongside `NFLOG`.
-
-### 5. Run the local dashboards
-
-```bash
-# Terminal 1 — DNS Dashboard (http://127.0.0.1:8787)
-python3 dns-dashboard/server.py --router-name "My Router"
-
-# Terminal 2 — Firewall Dashboard (http://127.0.0.1:8788)
-python3 firewall-dashboard/server.py --router-name "My Router"
-```
-
-Common flags:
-- `--api http://192.168.1.1:8789` (or `ROUTER_API` env var)
-- `--token-file ~/.ddwrt/nflogd.token` (or `ROUTER_TOKEN_FILE` env var)
-- `--router-name "WRT1900ACv2"` (or `ROUTER_NAME` env var)
-- `--demo` (synthetic demo mode, no router needed)
+*Tested on another router or DD-WRT/OpenWrt build? PRs adding to this table are welcome.*
 
 ---
 
@@ -198,19 +206,16 @@ All endpoints require `Authorization: Bearer <token>` and listen only on the con
 
 ---
 
-## Security Notes
+## Design, Accessibility & Security
 
-- **LAN-only binding**: `nflogd` binds strictly to `192.168.1.1:8789` (never `0.0.0.0`), and DD-WRT's `INPUT` chain drops unsolicited WAN traffic. If the token file is missing or empty, the HTTP API refuses to start.
-- **Plaintext HTTP on trusted LAN**: The router API uses HTTP (not TLS) with a 256-bit Bearer token to keep the router daemon tiny and dependency-free. This is appropriate on a trusted home LAN; do not expose port `8789` to WAN or untrusted guest VLANs.
-- **Local dashboards bind to `127.0.0.1` only** by default.
-- **Flash longevity**: Live logs write exclusively to RAM (`/tmp`), with a single compressed daily write to `/jffs/logs/` plus a hard `70%` `/jffs` capacity guard.
-
----
+- **Design System & WCAG 2.1 AA**: Documented in [DESIGN.md](DESIGN.md) (Enterprise SOC Dark + Light tokens, keyboard navigation, ARIA landmarks/roles, and accessible chart summaries).
+- **Security Policy & Threat Model**: See [SECURITY.md](SECURITY.md).
 
 ## Development & Tests
 
 ```bash
-make test
+make test       # Go tests, Python unit tests, JS & shell syntax checks
+make build-all  # Cross-compile armv7, arm64, mipsle
 ```
 
 ## License

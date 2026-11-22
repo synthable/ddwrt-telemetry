@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: nflogd/go.mod
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node (JS syntax check)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run tests & syntax checks
+        run: make test
+
+      - name: Cross-compile nflogd (armv7, arm64, mipsle)
+        run: make build-all

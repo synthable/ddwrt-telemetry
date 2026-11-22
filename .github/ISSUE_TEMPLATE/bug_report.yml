@@ -1,0 +1,43 @@
+name: Bug Report
+description: Report a bug in nflogd, router scripts, or either dashboard
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - nflogd (router daemon)
+        - DNS Dashboard (:8787)
+        - Firewall Dashboard (:8788)
+        - Router scripts / installation
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Clear description of the issue and expected behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Router & Host Environment
+      description: Please include router model, DD-WRT build, and kernel NFLOG output (redact WAN IPs/tokens).
+      value: |
+        - Router model:
+        - DD-WRT build (`cat /etc/version` or banner):
+        - Architecture (`uname -a`):
+        - NFLOG support (`cat /proc/net/netfilter/nf_log`):
+        - Host OS & Python version:
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs / Reproduction Steps
+      description: Redact any bearer tokens, public WAN IPs, or personal domains.
