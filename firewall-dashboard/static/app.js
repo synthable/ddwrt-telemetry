@@ -133,11 +133,26 @@
     renderTable(data.events);
   }
 
+  const CATEGORY_TOOLTIPS = {
+    probe: "Inferred probe: well-known/privileged destination port, TCP SYN, non-TCP/UDP protocol, or portscan/bruteforce rule",
+    stale: "Inferred stale return: late UDP from port 443/80/53 or TCP RST/FIN/ACK teardown to an ephemeral port (view-filterable; raw event preserved)",
+    ping: "ICMP packet dropped by firewall",
+    other: "Unsolicited dropped packet not matching probe, ping, or stale-return heuristics",
+    outbound: "Accepted connection egressing the configured WAN interface",
+    local: "Accepted connection staying on LAN or terminating at the router",
+  };
+
   function renderMeta(meta) {
     const routerName = meta.router_name || "DD-WRT Router";
     $("routerNameTitle").textContent = routerName;
     document.title = `${routerName} · Perimeter Firewall`;
     $("metaRouter").textContent = meta.router_host || "192.168.1.1:8789";
+    const scopeEl = $("metaScope");
+    if (scopeEl) {
+      const ipScope = meta.ip_scope || "IPv4 iptables";
+      const wanIface = meta.wan_iface || "wan";
+      scopeEl.textContent = `${ipScope} · WAN: ${wanIface}`;
+    }
     const mode = meta.transport || (meta.stream_connected ? "SSE Live" : "HTTP");
     $("metaSync").textContent = meta.last_sync_ts ? `${mode} · ${fmtClock(meta.last_sync_ts)}` : mode;
     $("metaSources").textContent = `${meta.sources.length} sources · ${fmtNum(meta.blocked_stored)} blocked / ${fmtNum(meta.allowed_stored)} allowed`;
@@ -152,18 +167,26 @@
       return;
     }
     box.innerHTML = items
-      .map(
-        (c) => `
-        <span class="kernel-pill mono" title="${escHtml(c.bytes)} bytes since last firewall reload">
+      .map((c) => {
+        const available = c.available !== false && c.pkts !== null && c.pkts !== undefined;
+        const title = available
+          ? `${escHtml(c.bytes ?? "0")} bytes since last firewall reload`
+          : "Rule or WAN interface not matched in current iptables snapshot (unavailable, not measured zero)";
+        const valHtml = available
+          ? `<span class="k-val">${fmtNum(c.pkts)}</span>`
+          : `<span class="k-val muted">N/A</span>`;
+        return `
+        <span class="kernel-pill mono" title="${title}">
           <span class="k-name">${escHtml(c.label)}</span>
-          <span class="k-val">${fmtNum(c.pkts)}</span>
-        </span>`
-      )
+          ${valHtml}
+        </span>`;
+      })
       .join("");
   }
 
   function renderFilters() {
     const chips = [];
+    if (state.hideStale) chips.push({ key: "hideStale", text: "view: hiding inferred stale return (raw events preserved)" });
     if (state.src) chips.push({ key: "src", text: `src: ${state.src}` });
     if (state.category !== "all") chips.push({ key: "category", text: `category: ${state.category}` });
     if (state.proto !== "all") chips.push({ key: "proto", text: `proto: ${state.proto}` });
@@ -447,10 +470,11 @@
         if (r.ttl !== null) metaParts.push(`ttl:${r.ttl}`);
         if (r.action !== "DROP" && r.action !== "ACCEPT") metaParts.push(r.action);
 
+        const catTip = CATEGORY_TOOLTIPS[r.category] || "Heuristic traffic classification";
         return `
           <tr class="${r.category === "probe" ? "row-probe" : ""}">
             <th scope="row" class="mono muted row-time" title="${escHtml(r.ts_iso)}">${fmtClock(r.ts)}</th>
-            <td><span class="cat-tag cat-${escHtml(r.category)}" aria-label="Category: ${escHtml(r.category)}">${escHtml(r.category)}</span></td>
+            <td><span class="cat-tag cat-${escHtml(r.category)}" title="${escHtml(catTip)}" aria-label="Inferred category: ${escHtml(r.category)}">${escHtml(r.category)}</span></td>
             <td><span class="proto-tag">${escHtml(r.proto)}</span></td>
             <td class="mono">
               <button type="button" class="cell-link" data-filter-src="${escHtml(r.src_ip)}" title="${escHtml(r.src_ip)}${r.spt ? ":" + r.spt : ""}">${escHtml(srcFull)}</button>
@@ -624,6 +648,10 @@
     const btn = e.target.closest("button[data-clear]");
     if (!btn) return;
     const k = btn.dataset.clear;
+    if (k === "hideStale") {
+      state.hideStale = false;
+      $("hideStaleToggle").checked = false;
+    }
     if (k === "src") state.src = "";
     if (k === "category") setCategory("all");
     if (k === "proto") state.proto = "all";
@@ -637,6 +665,8 @@
   });
 
   $("clearFiltersBtn").addEventListener("click", () => {
+    state.hideStale = false;
+    $("hideStaleToggle").checked = false;
     state.src = "";
     state.category = "all";
     state.proto = "all";

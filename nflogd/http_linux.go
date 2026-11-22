@@ -242,12 +242,18 @@ func startHTTPServer(cfg apiConfig) *http.Server {
 
 		archives := listArchives(cfg.ArchiveDir)
 
+		wanIface := ""
+		if routeOut, err := exec.Command("ip", "route", "show", "default").Output(); err == nil {
+			wanIface = parseDefaultRouteIface(string(routeOut))
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"dnsmasq_conf": readStr("/tmp/dnsmasq.conf"),
 			"leases":       readStr("/jffs/dnsmasq.leases"),
 			"iptables":     iptOut,
 			"archives":     archives,
+			"wan_iface":    wanIface,
 		})
 	}))
 

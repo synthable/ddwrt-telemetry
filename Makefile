@@ -35,8 +35,9 @@ test:
 	cd nflogd && go test -v ./...
 	cd dns-dashboard && python3 -m py_compile parser.py server.py && python3 -m unittest -v test_parser.py test_server.py
 	cd firewall-dashboard && python3 -m py_compile parser.py server.py && python3 -m unittest -v test_parser.py test_server.py
-	sh -n router-scripts/archive-logs.sh router-scripts/test_archive.sh
+	sh -n router-scripts/archive-logs.sh router-scripts/test_archive.sh router-scripts/rc_firewall.sh router-scripts/test_rc_firewall.sh
 	sh router-scripts/test_archive.sh
+	sh router-scripts/test_rc_firewall.sh
 	bash -n scripts/run-dashboards.sh scripts/install-router.sh
 	@if command -v node >/dev/null 2>&1; then \
 		node --check dns-dashboard/static/app.js && node --check firewall-dashboard/static/app.js; \
