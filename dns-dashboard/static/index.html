@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DD-WRT Router · DNS Telemetry</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="/styles.css" />
+  <script>
+    (function () {
+      var q = new URLSearchParams(location.search).get("theme");
+      var saved = localStorage.getItem("ddwrt-theme");
+      var pref = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+      document.documentElement.dataset.theme = q === "light" || q === "dark" ? q : (saved || pref);
+    })();
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to main telemetry</a>
+  <div class="shell">
+    <!-- Top Command Header -->
+    <header class="topbar" role="banner">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <span class="led" id="syncLed"></span>
+        </div>
+        <div>
+          <div class="title-row">
+            <h1 class="brand-title"><span id="routerNameTitle">DD-WRT Router</span> <span class="brand-sep" aria-hidden="true">/</span> DNS Telemetry</h1>
+            <a class="nav-pill mono" href="http://127.0.0.1:8788" target="_blank" rel="noopener">Firewall :8788 ↗</a>
+          </div>
+          <div class="brand-meta">
+            <span id="metaRouter">192.168.1.1</span>
+            <span class="dot" aria-hidden="true">·</span>
+            <span id="metaSync">Not synced yet</span>
+            <span class="dot" aria-hidden="true">·</span>
+            <span id="metaSources">0 sources</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="controls">
+        <div class="segmented" id="rangeSelector" role="radiogroup" aria-label="Query time window">
+          <button type="button" role="radio" aria-checked="false" data-range="15m">15m</button>
+          <button type="button" role="radio" aria-checked="false" data-range="1h">1h</button>
+          <button type="button" role="radio" aria-checked="false" data-range="6h">6h</button>
+          <button type="button" role="radio" aria-checked="false" data-range="24h">24h</button>
+          <button type="button" role="radio" aria-checked="false" data-range="7d">7d</button>
+          <button type="button" role="radio" aria-checked="true" data-range="all" class="active">All</button>
+        </div>
+
+        <label class="toggle-chip" title="Hide reverse-DNS PTR lookups">
+          <input type="checkbox" id="hidePtrToggle" />
+          <span>Hide PTR</span>
+        </label>
+
+        <select id="autoRefreshSelect" class="select-ctrl" aria-label="Live UI refresh interval">
+          <option value="3" selected>Live: 3s</option>
+          <option value="10">Live: 10s</option>
+          <option value="30">Live: 30s</option>
+          <option value="0">Live: Paused</option>
+        </select>
+
+        <button type="button" class="btn btn-ghost" id="themeToggleBtn" aria-label="Switch color theme" aria-pressed="false" title="Toggle Light / Dark mode">
+          <span id="themeToggleIcon" aria-hidden="true">☀</span>
+          <span id="themeToggleLabel">Light</span>
+        </button>
+        <button type="button" class="btn btn-ghost" id="exportBtn" title="Export filtered queries as CSV">CSV</button>
+        <button type="button" class="btn btn-primary" id="syncBtn">
+          <span class="sync-icon" aria-hidden="true">↻</span>
+          <span id="syncBtnLabel">Sync Router</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Error / Status Toast -->
+    <div class="banner banner-error hidden" id="errorBanner" role="alert"></div>
+
+    <!-- Active Filter Bar -->
+    <div class="filter-bar hidden" id="activeFilterBar" role="region" aria-label="Active filters">
+      <span class="filter-bar-label">ACTIVE FILTERS</span>
+      <div class="filter-chips" id="activeFilterChips"></div>
+      <button type="button" class="btn-link" id="clearFiltersBtn">Reset all</button>
+    </div>
+
+    <!-- KPI Telemetry Strip -->
+    <section class="kpi-grid" aria-label="DNS summary metrics">
+      <article class="kpi-card kpi-total">
+        <div class="kpi-head">
+          <h2 class="kpi-label">TOTAL QUERIES</h2>
+          <span class="kpi-badge mono" id="kpiQpm">0.0 /m</span>
+        </div>
+        <div class="kpi-value mono" id="kpiTotal" aria-live="polite">0</div>
+        <div class="kpi-sub" id="kpiSpan">Awaiting log data</div>
+      </article>
+
+      <article class="kpi-card kpi-blocked clickable" role="button" tabindex="0" aria-pressed="false" data-status-click="blocked" title="Click to filter blocked queries">
+        <div class="kpi-head">
+          <h2 class="kpi-label">ADGUARD BLOCKED</h2>
+          <span class="kpi-badge badge-blocked mono" id="kpiBlockedPct">0.0%</span>
+        </div>
+        <div class="kpi-value mono" id="kpiBlocked" aria-live="polite">0</div>
+        <div class="kpi-sub">Null-routed (0.0.0.0 / ::)</div>
+      </article>
+
+      <article class="kpi-card kpi-cached clickable" role="button" tabindex="0" aria-pressed="false" data-status-click="cached" title="Click to filter cached queries">
+        <div class="kpi-head">
+          <h2 class="kpi-label">CACHE HIT RATE</h2>
+          <span class="kpi-badge badge-cached mono" id="kpiCachedCount">0</span>
+        </div>
+        <div class="kpi-value mono" id="kpiCachedPct" aria-live="polite">0.0%</div>
+        <div class="kpi-sub">Served locally by dnsmasq</div>
+      </article>
+
+      <article class="kpi-card kpi-clients">
+        <div class="kpi-head">
+          <h2 class="kpi-label">ACTIVE LAN DEVICES</h2>
+          <span class="kpi-badge mono" id="kpiNxCount">0 NX</span>
+        </div>
+        <div class="kpi-value mono" id="kpiClients" aria-live="polite">0</div>
+        <div class="kpi-sub" id="kpiTopClient">Top talker: —</div>
+      </article>
+    </section>
+
+    <!-- Main Asymmetric Workspace -->
+    <main class="workspace" id="main-content">
+      <!-- Left Primary Column -->
+      <div class="col-main">
+        <!-- Timeline Chart -->
+        <section class="panel" aria-labelledby="timelineHeading">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title" id="timelineHeading">Query Activity Timeline</h2>
+              <p class="panel-sub">Stacked volume by resolution status</p>
+            </div>
+            <div class="legend" aria-hidden="true">
+              <span class="legend-item"><i class="swatch sw-allowed"></i>Allowed</span>
+              <span class="legend-item"><i class="swatch sw-cached"></i>Cached</span>
+              <span class="legend-item"><i class="swatch sw-blocked"></i>Blocked</span>
+              <span class="legend-item"><i class="swatch sw-nxdomain"></i>NXDOMAIN</span>
+            </div>
+          </div>
+          <div class="chart-wrap" id="timelineWrap">
+            <svg
+              id="timelineSvg"
+              class="timeline-svg"
+              viewBox="0 0 800 180"
+              preserveAspectRatio="none"
+              role="img"
+              aria-label="DNS query activity timeline"
+              aria-describedby="timelineSummary"
+            ></svg>
+            <p class="sr-only" id="timelineSummary">No queries loaded yet.</p>
+            <div class="chart-tooltip hidden" id="chartTooltip" role="status"></div>
+            <div class="chart-empty hidden" id="timelineEmpty">No queries in selected window</div>
+          </div>
+          <div class="chart-axis mono" id="timelineAxis" aria-hidden="true"></div>
+        </section>
+
+        <!-- Live Query Stream -->
+        <section class="panel panel-stream" aria-labelledby="streamHeading">
+          <div class="panel-header stream-header">
+            <div>
+              <h2 class="panel-title" id="streamHeading">Query Log Stream</h2>
+              <p class="panel-sub" id="streamCountLabel" aria-live="polite">Showing 0 of 0</p>
+            </div>
+            <div class="stream-tools">
+              <label for="searchInput" class="sr-only">Filter DNS queries by domain, device, IP, or answer</label>
+              <input
+                type="search"
+                id="searchInput"
+                class="search-input mono"
+                placeholder="Filter domain, device, IP, answer..."
+                autocomplete="off"
+              />
+              <div class="status-pills" id="statusPills" role="radiogroup" aria-label="Filter by resolution status">
+                <button type="button" role="radio" aria-checked="true" data-status="all" class="active">All</button>
+                <button type="button" role="radio" aria-checked="false" data-status="blocked">Blocked</button>
+                <button type="button" role="radio" aria-checked="false" data-status="allowed">Allowed</button>
+                <button type="button" role="radio" aria-checked="false" data-status="cached">Cached</button>
+                <button type="button" role="radio" aria-checked="false" data-status="nxdomain">NX</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table class="log-table" aria-label="Real-time DNS Query Log Stream">
+              <thead>
+                <tr>
+                  <th scope="col" class="col-time">Time</th>
+                  <th scope="col" class="col-device">LAN Device</th>
+                  <th scope="col" class="col-type">Type</th>
+                  <th scope="col" class="col-domain">Domain</th>
+                  <th scope="col" class="col-status">Status</th>
+                  <th scope="col" class="col-answer">Answer / Upstream</th>
+                </tr>
+              </thead>
+              <tbody id="queryTableBody"></tbody>
+            </table>
+            <div class="table-empty hidden" id="tableEmpty">No matching DNS queries.</div>
+          </div>
+
+          <div class="table-footer">
+            <span class="mono muted" id="pageStatus">—</span>
+            <div class="pager">
+              <button type="button" class="btn btn-ghost btn-sm" id="prevPageBtn" disabled>← Newer</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="nextPageBtn" disabled>Older →</button>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- Right Telemetry Rail -->
+      <aside class="col-rail" aria-label="LAN devices and domain leaderboards">
+        <!-- LAN Devices Matrix -->
+        <section class="panel" aria-labelledby="devicesHeading">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title" id="devicesHeading">LAN Devices</h2>
+              <p class="panel-sub">Click a device to isolate its queries</p>
+            </div>
+            <span class="pill-count mono" id="deviceTotalBadge">0</span>
+          </div>
+          <div class="device-list" id="deviceList"></div>
+        </section>
+
+        <!-- Leaderboards (Top Queried / Top Blocked) -->
+        <section class="panel" aria-label="Domain leaderboards">
+          <div class="panel-header">
+            <div class="tab-group" id="domainTabs" role="tablist" aria-label="Leaderboard category">
+              <button type="button" role="tab" aria-selected="true" data-tab="domains" class="active">Top Domains</button>
+              <button type="button" role="tab" aria-selected="false" data-tab="blocked">Top Blocked</button>
+              <button type="button" role="tab" aria-selected="false" data-tab="nxdomain">NXDOMAIN</button>
+            </div>
+          </div>
+          <div class="bar-list" id="domainLeaderboard" role="tabpanel"></div>
+        </section>
+
+        <!-- Query Types -->
+        <section class="panel" aria-labelledby="qtypesHeading">
+          <div class="panel-header">
+            <h2 class="panel-title" id="qtypesHeading">Record Types</h2>
+          </div>
+          <div class="qtype-grid" id="qtypeGrid"></div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

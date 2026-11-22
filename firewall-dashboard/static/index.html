@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DD-WRT Router · Perimeter Firewall</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="/styles.css" />
+  <script>
+    (function () {
+      var q = new URLSearchParams(location.search).get("theme");
+      var saved = localStorage.getItem("ddwrt-theme");
+      var pref = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+      document.documentElement.dataset.theme = q === "light" || q === "dark" ? q : (saved || pref);
+    })();
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to main telemetry</a>
+  <div class="shell">
+    <!-- Top Tactical Header -->
+    <header class="topbar" role="banner">
+      <div class="brand">
+        <div class="shield-badge" aria-hidden="true">
+          <span class="pulse-dot" id="syncLed"></span>
+        </div>
+        <div>
+          <div class="title-row">
+            <h1 class="brand-title"><span id="routerNameTitle">DD-WRT Router</span> <span class="sep" aria-hidden="true">//</span> PERIMETER FIREWALL</h1>
+            <a class="nav-pill mono" href="http://127.0.0.1:8787" target="_blank" rel="noopener">DNS :8787 ↗</a>
+          </div>
+          <div class="brand-meta mono">
+            <span id="metaRouter">192.168.1.1</span>
+            <span class="sep" aria-hidden="true">·</span>
+            <span id="metaSync">Not synced</span>
+            <span class="sep" aria-hidden="true">·</span>
+            <span id="metaSources">0 sources</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="controls">
+        <div class="segmented" id="verdictSelector" role="radiogroup" aria-label="Firewall verdict">
+          <button type="button" role="radio" aria-checked="true" data-verdict="blocked" class="active">Blocked</button>
+          <button type="button" role="radio" aria-checked="false" data-verdict="allowed">Allowed</button>
+          <button type="button" role="radio" aria-checked="false" data-verdict="all">All</button>
+        </div>
+
+        <div class="segmented" id="rangeSelector" role="radiogroup" aria-label="Event time window">
+          <button type="button" role="radio" aria-checked="false" data-range="15m">15m</button>
+          <button type="button" role="radio" aria-checked="false" data-range="1h">1h</button>
+          <button type="button" role="radio" aria-checked="false" data-range="6h">6h</button>
+          <button type="button" role="radio" aria-checked="false" data-range="24h">24h</button>
+          <button type="button" role="radio" aria-checked="false" data-range="7d">7d</button>
+          <button type="button" role="radio" aria-checked="true" data-range="all" class="active">All</button>
+        </div>
+
+        <label class="toggle-chip" title="Hide late QUIC (UDP 443) and TCP RST teardown drops">
+          <input type="checkbox" id="hideStaleToggle" />
+          <span>Hide Stale Return</span>
+        </label>
+
+        <select id="autoRefreshSelect" class="select-ctrl" aria-label="Live UI refresh interval">
+          <option value="3" selected>Live: 3s</option>
+          <option value="10">Live: 10s</option>
+          <option value="30">Live: 30s</option>
+          <option value="0">Live: Paused</option>
+        </select>
+
+        <button type="button" class="btn btn-ghost" id="themeToggleBtn" aria-label="Switch color theme" aria-pressed="false" title="Toggle Light / Dark mode">
+          <span id="themeToggleIcon" aria-hidden="true">☀</span>
+          <span id="themeToggleLabel">Light</span>
+        </button>
+        <button type="button" class="btn btn-ghost" id="exportBtn" title="Export filtered events as CSV">CSV</button>
+        <button type="button" class="btn btn-primary" id="syncBtn">
+          <span class="sync-icon" aria-hidden="true">↻</span>
+          <span id="syncBtnLabel">Sync Router</span>
+        </button>
+      </div>
+    </header>
+
+    <div class="banner banner-error hidden" id="errorBanner" role="alert"></div>
+
+    <!-- Live Kernel iptables Counter Strip -->
+    <section class="kernel-strip" aria-label="Live kernel iptables counters">
+      <div class="kernel-strip-label mono">LIVE KERNEL COUNTERS</div>
+      <div class="kernel-items" id="kernelCounters"></div>
+    </section>
+
+    <!-- Active Filter Bar -->
+    <div class="filter-bar hidden" id="activeFilterBar" role="region" aria-label="Active filters">
+      <span class="filter-label mono">FILTERED BY</span>
+      <div class="filter-chips" id="activeFilterChips"></div>
+      <button type="button" class="btn-link" id="clearFiltersBtn">Reset all</button>
+    </div>
+
+    <!-- KPI Strip -->
+    <section class="kpi-grid" aria-label="Firewall summary metrics">
+      <article class="kpi-card kpi-total">
+        <div class="kpi-head">
+          <h2 class="kpi-label mono">LOGGED DROPS</h2>
+          <span class="kpi-badge mono" id="kpiEpm">0.0 /m</span>
+        </div>
+        <div class="kpi-value mono" id="kpiTotal" aria-live="polite">0</div>
+        <div class="kpi-sub" id="kpiSpan">Awaiting firewall log data</div>
+      </article>
+
+      <article class="kpi-card kpi-probe clickable" role="button" tabindex="0" aria-pressed="false" data-cat-click="probe" title="Click to isolate inbound probes & scans">
+        <div class="kpi-head">
+          <h2 class="kpi-label mono">INBOUND PROBES</h2>
+          <span class="kpi-badge badge-probe mono" id="kpiProbePct">0.0%</span>
+        </div>
+        <div class="kpi-value mono" id="kpiProbes" aria-live="polite">0</div>
+        <div class="kpi-sub" id="kpiPingSub">0 ICMP pings</div>
+      </article>
+
+      <article class="kpi-card kpi-sources">
+        <div class="kpi-head">
+          <h2 class="kpi-label mono">UNIQUE SOURCE IPs</h2>
+          <span class="kpi-badge mono" id="kpiStaleBadge">0 stale</span>
+        </div>
+        <div class="kpi-value mono" id="kpiSources" aria-live="polite">0</div>
+        <div class="kpi-sub mono" id="kpiTopSource">Top: —</div>
+      </article>
+
+      <article class="kpi-card kpi-targets">
+        <div class="kpi-head">
+          <h2 class="kpi-label mono">TARGETED SERVICES</h2>
+          <span class="kpi-badge badge-amber mono" id="kpiTopPortBadge">—</span>
+        </div>
+        <div class="kpi-value mono" id="kpiTargets" aria-live="polite">0</div>
+        <div class="kpi-sub" id="kpiTopPortSub">Distinct destination ports / protos</div>
+      </article>
+    </section>
+
+    <!-- Main Workspace -->
+    <main class="workspace" id="main-content">
+      <div class="col-main">
+        <!-- Activity Timeline -->
+        <section class="panel" aria-labelledby="timelineHeading">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title" id="timelineHeading">Perimeter Drop Timeline</h2>
+              <p class="panel-sub">Classified by Probes, ICMP Pings, Unsolicited Other, and Stale Return traffic</p>
+            </div>
+            <div class="legend" aria-hidden="true">
+              <span class="legend-item"><i class="sw sw-probe"></i>Probe</span>
+              <span class="legend-item"><i class="sw sw-ping"></i>Ping</span>
+              <span class="legend-item"><i class="sw sw-other"></i>Other</span>
+              <span class="legend-item"><i class="sw sw-stale"></i>Stale</span>
+              <span class="legend-item"><i class="sw sw-outbound"></i>Outbound</span>
+              <span class="legend-item"><i class="sw sw-local"></i>Local</span>
+            </div>
+          </div>
+          <div class="chart-wrap" id="timelineWrap">
+            <svg
+              id="timelineSvg"
+              class="timeline-svg"
+              viewBox="0 0 800 175"
+              preserveAspectRatio="none"
+              role="img"
+              aria-label="Perimeter firewall event timeline"
+              aria-describedby="timelineSummary"
+            ></svg>
+            <p class="sr-only" id="timelineSummary">No firewall events loaded yet.</p>
+            <div class="chart-tooltip hidden" id="chartTooltip" role="status"></div>
+            <div class="chart-empty hidden" id="timelineEmpty">No firewall events in selected window</div>
+          </div>
+          <div class="chart-axis mono" id="timelineAxis" aria-hidden="true"></div>
+        </section>
+
+        <!-- Packet Stream Table -->
+        <section class="panel" aria-labelledby="streamHeading">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title" id="streamHeading">Packet Drop Log</h2>
+              <p class="panel-sub" id="streamCountLabel" aria-live="polite">Showing 0 of 0</p>
+            </div>
+            <div class="stream-tools">
+              <label for="searchInput" class="sr-only">Search firewall events by IP, port, service, protocol, or TCP flag</label>
+              <input
+                type="search"
+                id="searchInput"
+                class="search-input mono"
+                placeholder="Search IP, port, service, proto, flag..."
+                autocomplete="off"
+              />
+              <div class="cat-pills" id="catPills" role="radiogroup" aria-label="Filter by traffic category">
+                <button type="button" role="radio" aria-checked="true" data-cat="all" class="active">All</button>
+                <button type="button" role="radio" aria-checked="false" data-cat="probe">Probes</button>
+                <button type="button" role="radio" aria-checked="false" data-cat="ping">Pings</button>
+                <button type="button" role="radio" aria-checked="false" data-cat="other">Other</button>
+                <button type="button" role="radio" aria-checked="false" data-cat="stale">Stale</button>
+                <button type="button" role="radio" aria-checked="false" data-cat="outbound">Outbound</button>
+                <button type="button" role="radio" aria-checked="false" data-cat="local">Local</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table class="log-table" aria-label="Real-time Firewall Packet Log">
+              <thead>
+                <tr>
+                  <th scope="col">Time</th>
+                  <th scope="col">Category</th>
+                  <th scope="col">Proto</th>
+                  <th scope="col">Source IP : Port</th>
+                  <th scope="col">Target Port / Service</th>
+                  <th scope="col">Details</th>
+                </tr>
+              </thead>
+              <tbody id="eventTableBody"></tbody>
+            </table>
+            <div class="table-empty hidden" id="tableEmpty">No matching firewall events.</div>
+          </div>
+
+          <div class="table-footer">
+            <span class="mono muted" id="pageStatus">—</span>
+            <div class="pager">
+              <button type="button" class="btn btn-ghost btn-sm" id="prevPageBtn" disabled>← Newer</button>
+              <button type="button" class="btn btn-ghost btn-sm" id="nextPageBtn" disabled>Older →</button>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      <!-- Right Intelligence Rail -->
+      <aside class="col-rail" aria-label="Source IPs, targeted ports, and protocols">
+        <!-- Top Source IPs -->
+        <section class="panel" aria-labelledby="sourcesHeading">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title" id="sourcesHeading">Top Source IPs</h2>
+              <p class="panel-sub">Click an IP to isolate its activity</p>
+            </div>
+            <span class="pill-count mono" id="srcCountBadge">0</span>
+          </div>
+          <div class="intel-list" id="sourceList"></div>
+        </section>
+
+        <!-- Targeted Ports & Services -->
+        <section class="panel" aria-labelledby="portsHeading">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title" id="portsHeading">Targeted Ports &amp; Protocols</h2>
+              <p class="panel-sub">Click a service to filter drops</p>
+            </div>
+          </div>
+          <div class="bar-list" id="portLeaderboard"></div>
+        </section>
+
+        <!-- Protocol Breakdown -->
+        <section class="panel" aria-labelledby="protosHeading">
+          <div class="panel-header">
+            <h2 class="panel-title" id="protosHeading">Protocols</h2>
+          </div>
+          <div class="proto-grid" id="protoGrid"></div>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+# Local runtime data & caches (NEVER commit real LAN logs or tokens)
+**/data/
+*.token
+*.log
+*.log.gz
+*.log.prev
+
+# Compiled binaries (publish via GitHub Releases or build with `make`)
+nflogd/dist/
+nflogd/nflogd-*
+nflogd/nflogd
+
+# Python
+**/__pycache__/
+*.pyc
+.pytest_cache/
+
+# macOS / Editors
+.DS_Store
+.vscode/
+.idea/
