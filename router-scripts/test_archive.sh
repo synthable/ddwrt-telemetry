@@ -3,6 +3,8 @@
 #  1) Failed archive write/verification preserves rotated sources and leaves no corrupt .gz
 #  2) Subsequent retry merges new live records with preserved sources and recovers 100% of records
 #  3) Verified archival cleans rotated sources and writes valid gzip snapshots
+#  4) Hourly ramcheck with existing .prev and failed archive write exits non-zero, preserves BOTH
+#     old and new DNS records, recovers both on retry, and bounds RAM usage under repeated failures
 
 set -eu
 
@@ -148,50 +150,81 @@ case "$ACCEPT_CONTENT" in
     ;;
 esac
 
-# --- Test 4: Repeated ramcheck bounds RAM usage and archives overflow .prev ---
+# --- Test 4: Hourly ramcheck with existing .prev and failed archive write ---
+# Must exit non-zero, preserve BOTH old (.prev) and new (live) records, and archive both on retry.
 RAM_LOG_DIR="${TMP_ROOT}/jffs/ramcheck-logs"
 RAM_DNS="${RAM_DIR}/ram-dns.log"
 mkdir -p "$RAM_LOG_DIR"
 
-python3 -c 'print("A" * 2048 + " ram-batch-1")' > "$RAM_DNS"
+# 4a) First ramcheck rotates old record into .prev
+python3 -c 'print("Nov 22 01:00:01 dnsmasq[1]: query[A] old-ramcheck.example.com from 192.168.1.10\n" + "# " + "A" * 2048)' > "$RAM_DNS"
 LOG_DIR="$RAM_LOG_DIR" DNS_LOG="$RAM_DNS" JFFS_MOUNT="${TMP_ROOT}/no-jffs" \
   GZIP_BIN=gzip SKIP_SIGNALS=1 MAX_RAM_KB=1 MAX_JFFS_PCT=100 \
   sh "$ARCHIVE_SCRIPT" ramcheck
 
 [ -s "${RAM_DNS}.prev" ] || { echo "FAIL: first ramcheck did not rotate live DNS log to .prev" >&2; exit 1; }
-SIZE_AFTER_FIRST=$(wc -c < "${RAM_DNS}.prev" | tr -d ' ')
 
-python3 -c 'print("B" * 2048 + " ram-batch-2")' > "$RAM_DNS"
+# 4b) Second ramcheck with new record and failing gzip must fail visibly (exit non-zero) and preserve both
+python3 -c 'print("Nov 22 02:00:01 dnsmasq[1]: query[A] new-ramcheck.example.com from 192.168.1.10\n" + "# " + "B" * 2048)' > "$RAM_DNS"
+if LOG_DIR="$RAM_LOG_DIR" DNS_LOG="$RAM_DNS" JFFS_MOUNT="${TMP_ROOT}/no-jffs" \
+   GZIP_BIN="$FAIL_GZIP" SKIP_SIGNALS=1 MAX_RAM_KB=1 MAX_JFFS_PCT=100 \
+   sh "$ARCHIVE_SCRIPT" ramcheck 2>/dev/null; then
+  echo "FAIL: expected ramcheck to exit non-zero when archive write fails" >&2
+  exit 1
+fi
+
+if ls "${RAM_LOG_DIR}/"*.log.gz >/dev/null 2>&1; then
+  echo "FAIL: ramcheck published an unverified archive on failure" >&2
+  exit 1
+fi
+
+# Verify both old and new records remain recoverable in RAM files
+COMBINED_PENDING=$(cat "${RAM_DNS}.prev" "${RAM_DNS}.rot" 2>/dev/null)
+for REC in old-ramcheck.example.com new-ramcheck.example.com; do
+  case "$COMBINED_PENDING" in
+    *"$REC"*) ;;
+    *)
+      echo "FAIL: pending RAM logs lost $REC after failed ramcheck archive write" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# 4c) Retry ramcheck with working gzip must archive BOTH old and new records and clean up .prev/.rot
 LOG_DIR="$RAM_LOG_DIR" DNS_LOG="$RAM_DNS" JFFS_MOUNT="${TMP_ROOT}/no-jffs" \
   GZIP_BIN=gzip SKIP_SIGNALS=1 MAX_RAM_KB=1 MAX_JFFS_PCT=100 \
   sh "$ARCHIVE_SCRIPT" ramcheck
 
-SIZE_AFTER_SECOND=$(wc -c < "${RAM_DNS}.prev" | tr -d ' ')
-if [ "$SIZE_AFTER_SECOND" -gt "$SIZE_AFTER_FIRST" ]; then
-  echo "FAIL: ramcheck grew .prev unboundedly ($SIZE_AFTER_SECOND > $SIZE_AFTER_FIRST)" >&2
+if [ -e "${RAM_DNS}.prev" ] || [ -e "${RAM_DNS}.rot" ]; then
+  echo "FAIL: ramcheck retry did not clean up .prev/.rot after verified archive" >&2
   exit 1
 fi
 
 RAM_ARCH=$(ls "${RAM_LOG_DIR}"/dns-*.log.gz | head -n 1)
 gzip -t "$RAM_ARCH"
-case "$(gzip -dc "$RAM_ARCH")" in
-  *"ram-batch-1"*) ;;
-  *)
-    echo "FAIL: overflow ramcheck archive missing ram-batch-1" >&2
-    exit 1
-    ;;
-esac
+RAM_ARCH_CONTENT=$(gzip -dc "$RAM_ARCH")
+for REC in old-ramcheck.example.com new-ramcheck.example.com; do
+  case "$RAM_ARCH_CONTENT" in
+    *"$REC"*) ;;
+    *)
+      echo "FAIL: ramcheck retry archive missing $REC" >&2
+      exit 1
+      ;;
+  esac
+done
 
-# Even if archival fails during ramcheck, .prev must stay bounded rather than accumulating
-python3 -c 'print("C" * 2048 + " ram-batch-3")' > "$RAM_DNS"
-LOG_DIR="$RAM_LOG_DIR" DNS_LOG="$RAM_DNS" JFFS_MOUNT="${TMP_ROOT}/no-jffs" \
-  GZIP_BIN="$FAIL_GZIP" SKIP_SIGNALS=1 MAX_RAM_KB=1 MAX_JFFS_PCT=100 \
-  sh "$ARCHIVE_SCRIPT" ramcheck 2>/dev/null
+# 4d) Verify RAM cap under repeated archive failures (cannot grow without bound)
+for BATCH in 1 2 3 4 5; do
+  python3 -c "print('Nov 22 03:00:0${BATCH} dnsmasq[1]: query[A] batch-${BATCH}.example.com from 192.168.1.10\n' + '# ' + 'X' * 2048)" > "$RAM_DNS"
+  LOG_DIR="$RAM_LOG_DIR" DNS_LOG="$RAM_DNS" JFFS_MOUNT="${TMP_ROOT}/no-jffs" \
+    GZIP_BIN="$FAIL_GZIP" SKIP_SIGNALS=1 MAX_RAM_KB=1 MAX_JFFS_PCT=100 \
+    sh "$ARCHIVE_SCRIPT" ramcheck 2>/dev/null || true
+done
 
-SIZE_AFTER_THIRD=$(wc -c < "${RAM_DNS}.prev" | tr -d ' ')
-if [ "$SIZE_AFTER_THIRD" -gt "$SIZE_AFTER_FIRST" ]; then
-  echo "FAIL: ramcheck grew .prev on failed flush ($SIZE_AFTER_THIRD > $SIZE_AFTER_FIRST)" >&2
+PREV_BYTES=$(wc -c < "${RAM_DNS}.prev" | tr -d ' ')
+if [ "$PREV_BYTES" -gt 2048 ]; then
+  echo "FAIL: repeated failed ramcheck runs exceeded 2*MAX_RAM_KB cap ($PREV_BYTES > 2048)" >&2
   exit 1
 fi
 
-echo "PASS: archive-logs.sh verified (failure preservation, corruption rejection, retry recovery, bounded ramcheck)"
+echo "PASS: archive-logs.sh verified (failure preservation, corruption rejection, retry recovery, ramcheck failure visibility + recovery + RAM cap)"

@@ -35,13 +35,24 @@ ensure_nflogd() {
   pidof nflogd >/dev/null 2>&1 || ("$NFLOGD_BIN" </dev/null >/dev/null 2>&1 &)
 }
 
-# Preserve any leftover .rot from a prior failed archive run before rotating a fresh live log.
+# Preserve any leftover .rot from a prior failed archive run before rotating a fresh live log,
+# while capping .prev at 2 * MAX_RAM_KB so repeated archive failures cannot exhaust /tmp RAM.
 rotate_live_log() {
   SRC="$1"
   [ -s "$SRC" ] || return 1
   if [ -s "${SRC}.rot" ]; then
     if cat "${SRC}.rot" >> "${SRC}.prev"; then
       rm -f "${SRC}.rot"
+      MAX_PREV_BYTES=$((MAX_RAM_KB * 2048))
+      PREV_BYTES=$(wc -c < "${SRC}.prev" 2>/dev/null | tr -d ' ')
+      if [ -n "$PREV_BYTES" ] && [ "$PREV_BYTES" -gt "$MAX_PREV_BYTES" ]; then
+        CAP_TMP="${SRC}.prev.cap.$$"
+        if tail -c "$MAX_PREV_BYTES" "${SRC}.prev" > "$CAP_TMP" 2>/dev/null; then
+          mv -f "$CAP_TMP" "${SRC}.prev"
+        else
+          rm -f "$CAP_TMP"
+        fi
+      fi
     else
       echo "archive-logs: failed to merge prior ${SRC}.rot into ${SRC}.prev; skipping rotation" >&2
       return 1
@@ -119,22 +130,43 @@ prune_archives() {
 case "$1" in
   ramcheck)
     ensure_nflogd
+    NEED_ROTATE=0
     if [ -f "$DNS_LOG" ]; then
       KB=$(du -k "$DNS_LOG" 2>/dev/null | awk '{print $1}')
       if [ -n "$KB" ] && [ "$KB" -ge "$MAX_RAM_KB" ]; then
-        if [ -s "${DNS_LOG}.prev" ]; then
-          # Flush prior .prev to compressed archive if possible so RAM stays strictly bounded
-          TS=$(date +%Y%m%d-%H%M%S)
-          if mkdir -p "$LOG_DIR" 2>/dev/null && \
-             archive_files "${LOG_DIR}/dns-${TS}.log.gz" "${DNS_LOG}.prev"; then
-            rm -f "${DNS_LOG}.prev"
-            prune_archives
-          else
-            echo "archive-logs: ramcheck unable to archive ${DNS_LOG}.prev; replacing to enforce RAM cap" >&2
-          fi
-        fi
-        mv -f "$DNS_LOG" "${DNS_LOG}.prev" 2>/dev/null && reopen_dnsmasq
+        NEED_ROTATE=1
       fi
+    fi
+
+    if [ "$NEED_ROTATE" -eq 1 ]; then
+      if [ ! -s "${DNS_LOG}.prev" ] && [ ! -s "${DNS_LOG}.rot" ]; then
+        # First threshold crossing: rotate live DNS log to .prev in RAM
+        mv -f "$DNS_LOG" "${DNS_LOG}.prev" 2>/dev/null && reopen_dnsmasq
+        exit 0
+      fi
+      # .prev or .rot already exists: rotate live log to .rot (preserving any prior .rot into .prev)
+      # so neither old nor new records are lost if archival fails.
+      if rotate_live_log "$DNS_LOG"; then
+        reopen_dnsmasq
+      else
+        exit 1
+      fi
+    fi
+
+    # Flush pending .prev + .rot to a verified archive whenever a second rotation occurred
+    # or a previous ramcheck archive write failed and left .rot pending.
+    if [ -s "${DNS_LOG}.rot" ] || ( [ "$NEED_ROTATE" -eq 1 ] && [ -s "${DNS_LOG}.prev" ] ); then
+      mkdir -p "$LOG_DIR" 2>/dev/null || {
+        echo "archive-logs: ramcheck unable to create ${LOG_DIR}; preserving rotated logs" >&2
+        exit 1
+      }
+      TS=$(date +%Y%m%d-%H%M%S)
+      if archive_files "${LOG_DIR}/dns-${TS}.log.gz" "${DNS_LOG}.prev" "${DNS_LOG}.rot"; then
+        rm -f "${DNS_LOG}.prev" "${DNS_LOG}.rot"
+        prune_archives
+        exit 0
+      fi
+      exit 1
     fi
     exit 0
     ;;
