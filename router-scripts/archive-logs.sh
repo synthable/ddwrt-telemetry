@@ -21,6 +21,7 @@ SYSLOG_DIR="${SYSLOG_DIR:-/var/log}"
 JFFS_MOUNT="${JFFS_MOUNT:-/jffs}"
 NFLOGD_BIN="${NFLOGD_BIN:-/jffs/bin/nflogd}"
 GZIP_BIN="${GZIP_BIN:-gzip}"
+AWK_BIN="${AWK_BIN:-awk}"
 TMP_STATE_DIR="${TMPDIR:-/tmp}"
 MAX_KEEP="${MAX_KEEP:-14}"          # keep last 14 daily archives per log type
 MAX_JFFS_PCT="${MAX_JFFS_PCT:-70}"  # prune oldest archives if /jffs reaches 70%
@@ -63,6 +64,7 @@ rotate_live_log() {
 # Trim ${DNS_LOG}.prev on whole-line boundaries when repeated ramcheck archive failures
 # exceed 2 * MAX_RAM_KB, recording exact cumulative discarded_records and discarded_bytes
 # both on stderr and in an in-band header line preserved in the recovered archive.
+# Requires a zero exit status and valid numeric loss counts before promoting the temp file.
 trim_dns_prev_lines() {
   PREV_FILE="${DNS_LOG}.prev"
   [ -s "$PREV_FILE" ] || return 0
@@ -71,7 +73,8 @@ trim_dns_prev_lines() {
   [ -n "$CUR_BYTES" ] && [ "$CUR_BYTES" -gt "$MAX_PREV_BYTES" ] || return 0
 
   CAP_TMP="${PREV_FILE}.cap.$$"
-  OVERFLOW_INFO=$(awk -v max_bytes="$MAX_PREV_BYTES" -v out_file="$CAP_TMP" '
+  rm -f "$CAP_TMP"
+  if ! OVERFLOW_INFO=$("$AWK_BIN" -v max_bytes="$MAX_PREV_BYTES" -v out_file="$CAP_TMP" '
     NR == 1 && /^# archive-logs: RAM_CAP_OVERFLOW / {
       for (i = 1; i <= NF; i++) {
         if ($i ~ /^discarded_records=/) {
@@ -115,27 +118,75 @@ trim_dns_prev_lines() {
       }
       printf "%d|%d\n", tot_recs, tot_bytes
     }
-  ' "$PREV_FILE")
-
-  if [ -s "$CAP_TMP" ] && mv -f "$CAP_TMP" "$PREV_FILE"; then
-    DISC_RECS=${OVERFLOW_INFO%%|*}
-    DISC_BYTES=${OVERFLOW_INFO#*|}
-    echo "archive-logs: RAM_CAP_OVERFLOW on ${PREV_FILE}: discarded_records=${DISC_RECS} discarded_bytes=${DISC_BYTES} max_prev_bytes=${MAX_PREV_BYTES}" >&2
-  else
+  ' "$PREV_FILE"); then
     rm -f "$CAP_TMP"
+    echo "archive-logs: trim helper failed for ${PREV_FILE}; retaining original log" >&2
+    return 1
   fi
+
+  case "$OVERFLOW_INFO" in
+    *"|"*) ;;
+    *)
+      rm -f "$CAP_TMP"
+      echo "archive-logs: missing loss counts from trim helper for ${PREV_FILE}; retaining original log" >&2
+      return 1
+      ;;
+  esac
+
+  DISC_RECS=${OVERFLOW_INFO%%|*}
+  DISC_BYTES=${OVERFLOW_INFO#*|}
+  if [ -z "$DISC_RECS" ] || [ -z "$DISC_BYTES" ]; then
+    rm -f "$CAP_TMP"
+    echo "archive-logs: blank loss counts from trim helper for ${PREV_FILE}; retaining original log" >&2
+    return 1
+  fi
+  case "${DISC_RECS}${DISC_BYTES}" in
+    *[!0-9]*)
+      rm -f "$CAP_TMP"
+      echo "archive-logs: invalid loss counts (${OVERFLOW_INFO}) for ${PREV_FILE}; retaining original log" >&2
+      return 1
+      ;;
+  esac
+
+  if [ ! -s "$CAP_TMP" ]; then
+    rm -f "$CAP_TMP"
+    echo "archive-logs: empty trim output for ${PREV_FILE}; retaining original log" >&2
+    return 1
+  fi
+
+  if mv -f "$CAP_TMP" "$PREV_FILE"; then
+    echo "archive-logs: RAM_CAP_OVERFLOW on ${PREV_FILE}: discarded_records=${DISC_RECS} discarded_bytes=${DISC_BYTES} max_prev_bytes=${MAX_PREV_BYTES}" >&2
+    return 0
+  fi
+
+  rm -f "$CAP_TMP"
+  echo "archive-logs: unable to replace ${PREV_FILE} with trimmed log; retaining original log" >&2
+  return 1
 }
 
 # Rotate live DNS log during hourly ramcheck: if a prior ramcheck archive failed and left
 # .rot pending, merge .rot into .prev and bound .prev on whole-line boundaries at 2 * MAX_RAM_KB
-# so repeated ramcheck failures cannot exhaust /tmp RAM. Daily rotation uses rotate_live_log (uncapped).
+# so repeated ramcheck failures cannot exhaust /tmp RAM. If trimming fails, retain the original
+# .prev and .rot files untouched and return non-zero. Daily rotation uses rotate_live_log (uncapped).
 rotate_dns_for_ramcheck() {
   [ -s "$DNS_LOG" ] || return 1
   if [ -s "${DNS_LOG}.rot" ]; then
+    PREV_BAK="${DNS_LOG}.prev.bak.$$"
+    rm -f "$PREV_BAK"
+    if [ -s "${DNS_LOG}.prev" ]; then
+      cp -p "${DNS_LOG}.prev" "$PREV_BAK" 2>/dev/null || cp "${DNS_LOG}.prev" "$PREV_BAK" || return 1
+    fi
     if cat "${DNS_LOG}.rot" >> "${DNS_LOG}.prev"; then
-      rm -f "${DNS_LOG}.rot"
-      trim_dns_prev_lines
+      if trim_dns_prev_lines; then
+        rm -f "$PREV_BAK" "${DNS_LOG}.rot"
+      else
+        if [ -f "$PREV_BAK" ]; then
+          mv -f "$PREV_BAK" "${DNS_LOG}.prev"
+        fi
+        return 1
+      fi
     else
+      rm -f "$PREV_BAK"
       echo "archive-logs: failed to merge prior ${DNS_LOG}.rot into ${DNS_LOG}.prev; skipping rotation" >&2
       return 1
     fi

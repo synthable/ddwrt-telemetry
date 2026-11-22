@@ -301,7 +301,65 @@ for idx, line in enumerate(surviving, start=2):
 assert 4 in batches_seen and 5 in batches_seen, f"expected surviving records from batches 4 and 5, got {batches_seen}"
 PYEOF
 
-# 4e) Daily recovery must NOT truncate pending firewall logs even when MAX_RAM_KB=1
+# 4e) Partial-write failure in trim helper must retain original .prev bytes and return error to ramcheck
+rm -f "${RAM_LOG_DIR}/"*.log.gz "${RAM_DNS}" "${RAM_DNS}.prev" "${RAM_DNS}.rot"
+PARTIAL_AWK="${TMP_ROOT}/partial-awk.sh"
+cat > "$PARTIAL_AWK" <<'EOF'
+#!/bin/sh
+# Intercept the trim helper (invoked with -v out_file=...) to write a partial temp file and exit non-zero
+OUT_FILE=""
+for ARG in "$@"; do
+  case "$ARG" in
+    out_file=*) OUT_FILE=${ARG#out_file=} ;;
+  esac
+done
+if [ -n "$OUT_FILE" ]; then
+  printf 'partial-corrupt-trim-bytes\n' > "$OUT_FILE"
+  exit 1
+fi
+exec awk "$@"
+EOF
+chmod +x "$PARTIAL_AWK"
+
+python3 -c '
+for i in range(1, 25):
+    print(f"Nov 22 04:01:{i:02d} dnsmasq[1]: query[A] orig-prev-{i:02d}.example.com from 192.168.1.10")
+' > "${RAM_DNS}.prev"
+python3 -c '
+for i in range(1, 25):
+    print(f"Nov 22 04:02:{i:02d} dnsmasq[1]: query[A] orig-rot-{i:02d}.example.com from 192.168.1.10")
+' > "${RAM_DNS}.rot"
+python3 -c '
+for i in range(1, 25):
+    print(f"Nov 22 04:03:{i:02d} dnsmasq[1]: query[A] orig-live-{i:02d}.example.com from 192.168.1.10")
+' > "$RAM_DNS"
+
+ORIG_PREV_SNAP="${TMP_ROOT}/orig-prev.snap"
+ORIG_ROT_SNAP="${TMP_ROOT}/orig-rot.snap"
+cp "${RAM_DNS}.prev" "$ORIG_PREV_SNAP"
+cp "${RAM_DNS}.rot" "$ORIG_ROT_SNAP"
+
+if LOG_DIR="$RAM_LOG_DIR" DNS_LOG="$RAM_DNS" JFFS_MOUNT="${TMP_ROOT}/no-jffs" \
+   AWK_BIN="$PARTIAL_AWK" GZIP_BIN=gzip SKIP_SIGNALS=1 MAX_RAM_KB=1 MAX_JFFS_PCT=100 \
+   sh "$ARCHIVE_SCRIPT" ramcheck 2>/dev/null; then
+  echo "FAIL: expected ramcheck to fail when trim helper writes partial file and exits non-zero" >&2
+  exit 1
+fi
+
+if ! cmp -s "${RAM_DNS}.prev" "$ORIG_PREV_SNAP"; then
+  echo "FAIL: failed trim helper corrupted or replaced original dns.log.prev" >&2
+  exit 1
+fi
+if ! cmp -s "${RAM_DNS}.rot" "$ORIG_ROT_SNAP"; then
+  echo "FAIL: failed trim helper corrupted or lost original dns.log.rot" >&2
+  exit 1
+fi
+if ls "${RAM_DNS}.prev.cap."* >/dev/null 2>&1; then
+  echo "FAIL: temporary trim cap file left behind after failure" >&2
+  exit 1
+fi
+
+# 4f) Daily recovery must NOT truncate pending firewall logs even when MAX_RAM_KB=1
 FW_RECOVERY_DIR="${TMP_ROOT}/jffs/fw-recovery-logs"
 mkdir -p "$FW_RECOVERY_DIR"
 rm -f "${DNS_LOG}" "${DNS_LOG}.prev" "${DNS_LOG}.rot"
