@@ -128,9 +128,9 @@ sequenceDiagram
 - **Interactive filtering**: time ranges (`15m`–`7d`, `All`), `Hide PTR` toggle, instant search, record-type chips, live SSE updates, Dark/Light mode toggle, and CSV export.
 
 ### Perimeter Firewall Dashboard (`:8788`)
-- **Dual `Blocked` + `Allowed` views**: inspect both unsolicited WAN `DROP`/`REJECT`/`portscan` hits and `NEW` accepted outbound/LAN flows with resolved LAN device names.
-- **Automatic traffic classification + `Hide Stale Return` toggle**: separates genuine inbound probes (RDP `3389`, Memcached `11211`, SNMP `161`, SIP `5060`, IPMI `623`, raw GRE `47` / IP-in-IP `4`) and ICMP pings from harmless late QUIC (`UDP/443`) and TCP `RST` teardown noise.
-- **Live kernel `iptables` counters**: displays packet counts even for silent `DROP` rules (WAN SSH `:22`/`:2222`, `psd` port-scan drops, silent catch-all TCP drops).
+- **Dual `Blocked` + `Allowed` views (IPv4 `iptables`)**: inspect both unsolicited WAN `DROP`/`REJECT`/`portscan` hits and `NEW` accepted outbound/LAN flows with resolved LAN device names. *(Note: the supplied `router-scripts/rc_firewall.sh` instruments IPv4 `iptables` chains only; IPv6 `ip6tables` rules are not wired into `NFLOG` by default.)*
+- **Heuristic traffic classification + view-only `Hide Stale Return` toggle**: labels packets heuristically from ports, protocols, and TCP flags into `Probe` (e.g. RDP `3389`, Memcached `11211`, SNMP `161`, SIP `5060`, IPMI `623`, raw GRE `47` / IP-in-IP `4`, TCP `SYN`), `Ping`, `Other`, and `Stale Return` (late `UDP/443|80|53` and TCP `RST`/`FIN`/`ACK` teardown packets). Enabling **Hide Stale Return** only hides inferred stale drops from the active view — all underlying raw events remain stored and accessible when unchecked.
+- **Auto-detected WAN interface & live kernel `iptables` counters**: `nflogd` detects the default egress interface (`ip route show default`, e.g., `wan`, `eth0`, `vlan2`, `ppp0`) and exposes it via `/api/meta` (override with `--wan-iface` / `WAN_IFACE`). Displays packet counts for matched silent `DROP` rules and shows `N/A` when a rule or interface counter is unavailable rather than reporting `0`.
 - **Exact deduplication** across overlapping live and archived logs, plus local archive persistence under `data/archives/`.
 
 ### `nflogd` Router Daemon
@@ -168,7 +168,7 @@ sequenceDiagram
    ```
 3. **Upload to `/jffs`** and merge the templates in [`router-scripts/`](router-scripts/):
    - **Startup** (`rc_startup`): [`router-scripts/rc_startup.sh`](router-scripts/rc_startup.sh) (adjust `-tz` and `-http-listen` if needed)
-   - **Firewall** (`rc_firewall`): [`router-scripts/rc_firewall.sh`](router-scripts/rc_firewall.sh)
+   - **Firewall** (`rc_firewall`): [`router-scripts/rc_firewall.sh`](router-scripts/rc_firewall.sh) *(IPv4 `iptables` only; verifies `nfnetlink_log` + `NFLOG` support before touching chains, preserves custom rules without flushing, and supports `rc_firewall.sh rollback`)*
    - **Shutdown** (`rc_shutdown`): `/jffs/scripts/archive-logs.sh >/dev/null 2>&1`
    - **Additional Dnsmasq Options** (`dnsmasq_options`): [`router-scripts/dnsmasq_options.conf`](router-scripts/dnsmasq_options.conf)
    - **Cron Jobs** (`cron_jobs`): [`router-scripts/cron_jobs.txt`](router-scripts/cron_jobs.txt)

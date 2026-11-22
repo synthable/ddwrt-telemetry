@@ -31,6 +31,7 @@ ARCHIVES_DIR = DATA_DIR / "archives"
 
 DEFAULT_ROUTER_API = os.environ.get("ROUTER_API", "http://192.168.1.1:8789")
 DEFAULT_ROUTER_NAME = os.environ.get("ROUTER_NAME", "DD-WRT Router")
+DEFAULT_WAN_IFACE = os.environ.get("WAN_IFACE", "").strip()
 DEFAULT_TOKEN_FILE = os.environ.get(
     "ROUTER_TOKEN_FILE", str(Path.home() / ".ddwrt" / "nflogd.token")
 )
@@ -331,12 +332,12 @@ def generate_demo_firewall_data(
     events.sort(key=lambda e: (e.ts, float(e.ktime)))
 
     counters = {
-        "wan_ssh_22": {"label": "WAN SSH :22", "pkts": 1842, "bytes": "98K"},
-        "wan_ssh_2222": {"label": "WAN SSH :2222", "pkts": 276, "bytes": "14K"},
-        "wan_psd": {"label": "Port-Scan (psd)", "pkts": 3190, "bytes": "168K"},
-        "wan_icmp": {"label": "WAN ICMP Drop", "pkts": 1412, "bytes": "62K"},
-        "invalid_drop": {"label": "Invalid State", "pkts": 4380, "bytes": "204K"},
-        "tarpit_tcp": {"label": "Silent TCP Drop", "pkts": 94200, "bytes": "4820K"},
+        "wan_ssh_22": {"label": "WAN SSH :22", "pkts": 1842, "bytes": "98K", "available": True},
+        "wan_ssh_2222": {"label": "WAN SSH :2222", "pkts": 276, "bytes": "14K", "available": True},
+        "wan_psd": {"label": "Port-Scan (psd)", "pkts": 3190, "bytes": "168K", "available": True},
+        "wan_icmp": {"label": "WAN ICMP Drop", "pkts": 1412, "bytes": "62K", "available": True},
+        "invalid_drop": {"label": "Invalid State", "pkts": 4380, "bytes": "204K", "available": True},
+        "tarpit_tcp": {"label": "Silent TCP Drop", "pkts": 94200, "bytes": "4820K", "available": True},
     }
     return events, devices, counters
 
@@ -348,11 +349,14 @@ class FirewallStore:
         token_file: str = DEFAULT_TOKEN_FILE,
         router_name: str = DEFAULT_ROUTER_NAME,
         demo: bool = False,
+        wan_iface: str = DEFAULT_WAN_IFACE,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.token_file = Path(token_file)
         self.router_name = router_name
         self.demo = demo
+        self._wan_iface_override = wan_iface.strip()
+        self.wan_iface = self._wan_iface_override or self._read_persisted_wan_iface() or "wan"
         self._lock = threading.RLock()
         self.events: list[FirewallEvent] = []
         self._seen: set[str] = set()
@@ -397,6 +401,13 @@ class FirewallStore:
             headers = {k.lower(): v for k, v in resp.headers.items()}
             return resp.read(), headers
 
+    @staticmethod
+    def _read_persisted_wan_iface() -> str:
+        path = DATA_DIR / "wan_iface.txt"
+        if not path.exists():
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+
     def reload_local(self) -> None:
         if self.demo:
             return
@@ -408,7 +419,7 @@ class FirewallStore:
             conf_path.read_text(encoding="utf-8", errors="replace") if conf_path.exists() else "",
             leases_path.read_text(encoding="utf-8", errors="replace") if leases_path.exists() else "",
         )
-        events, counters, sources = load_all_logs(DATA_DIR)
+        events, counters, sources = load_all_logs(DATA_DIR, wan_iface=self.wan_iface)
         with self._lock:
             self.devices = devices
             self.events = events
@@ -461,6 +472,11 @@ class FirewallStore:
                 (DATA_DIR / "dnsmasq.conf").write_text(meta["dnsmasq_conf"], encoding="utf-8")
             if meta.get("leases"):
                 (DATA_DIR / "dnsmasq.leases").write_text(meta["leases"], encoding="utf-8")
+            detected_wan = str(meta.get("wan_iface") or "").strip()
+            if detected_wan:
+                (DATA_DIR / "wan_iface.txt").write_text(detected_wan + "\n", encoding="utf-8")
+                if not self._wan_iface_override:
+                    self.wan_iface = detected_wan
 
             new_archives = 0
             for name in meta.get("archives", []):
@@ -536,7 +552,7 @@ class FirewallStore:
                             self._tail_state[key] = (off + len((payload + "\n").encode("utf-8")), ino)
 
                             with self._lock:
-                                parsed = parse_lines([payload], self.devices)
+                                parsed = parse_lines([payload], self.devices, wan_iface=self.wan_iface)
                                 for ev in parsed:
                                     if ev.dedup_key not in self._seen:
                                         self._seen.add(ev.dedup_key)
@@ -677,6 +693,8 @@ class FirewallStore:
             "meta": {
                 "router_name": self.router_name,
                 "router_host": "demo" if self.demo else self.api_url.replace("http://", ""),
+                "wan_iface": self.wan_iface,
+                "ip_scope": "IPv4 iptables",
                 "transport": transport,
                 "stream_connected": stream_connected,
                 "last_sync_ts": last_sync_ts,
@@ -830,11 +848,22 @@ def main() -> None:
         default=DEFAULT_ROUTER_NAME,
         help="Router display name (default: ROUTER_NAME env var or 'DD-WRT Router')",
     )
+    ap.add_argument(
+        "--wan-iface",
+        default=DEFAULT_WAN_IFACE,
+        help="WAN interface name for outbound/counter matching (default: router /api/meta or 'wan'; env: WAN_IFACE)",
+    )
     ap.add_argument("--no-initial-sync", action="store_true", help="Skip initial sync on startup")
     ap.add_argument("--demo", action="store_true", help="Run with synthetic demo data (no router required)")
     args = ap.parse_args()
 
-    store = FirewallStore(args.api, args.token_file, router_name=args.router_name, demo=args.demo)
+    store = FirewallStore(
+        args.api,
+        args.token_file,
+        router_name=args.router_name,
+        demo=args.demo,
+        wan_iface=args.wan_iface,
+    )
     if args.demo:
         print(f"[demo] Loaded {len(store.events)} synthetic firewall events in memory", flush=True)
     else:

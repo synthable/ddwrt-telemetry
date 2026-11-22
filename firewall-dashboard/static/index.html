@@ -37,6 +37,8 @@
           <div class="brand-meta mono">
             <span id="metaRouter">192.168.1.1</span>
             <span class="sep" aria-hidden="true">·</span>
+            <span id="metaScope" title="Supplied rc_firewall.sh hooks IPv4 iptables chains only (IPv6 ip6tables not included)">IPv4 iptables · WAN: wan</span>
+            <span class="sep" aria-hidden="true">·</span>
             <span id="metaSync">Not synced</span>
             <span class="sep" aria-hidden="true">·</span>
             <span id="metaSources">0 sources</span>
@@ -60,7 +62,10 @@
           <button type="button" role="radio" aria-checked="true" data-range="all" class="active">All</button>
         </div>
 
-        <label class="toggle-chip" title="Hide late QUIC (UDP 443) and TCP RST teardown drops">
+        <label
+          class="toggle-chip"
+          title="View filter only: hides heuristically inferred late UDP 443/80/53 and TCP RST/FIN/ACK teardown drops. All raw events remain stored and accessible when unchecked."
+        >
           <input type="checkbox" id="hideStaleToggle" />
           <span>Hide Stale Return</span>
         </label>
@@ -110,9 +115,9 @@
         <div class="kpi-sub" id="kpiSpan">Awaiting firewall log data</div>
       </article>
 
-      <article class="kpi-card kpi-probe clickable" role="button" tabindex="0" aria-pressed="false" data-cat-click="probe" title="Click to isolate inbound probes & scans">
+      <article class="kpi-card kpi-probe clickable" role="button" tabindex="0" aria-pressed="false" data-cat-click="probe" title="Click to isolate heuristically inferred inbound probes and scans (well-known/privileged ports, TCP SYN, non-TCP/UDP protocols, portscan/bruteforce)">
         <div class="kpi-head">
-          <h2 class="kpi-label mono">INBOUND PROBES</h2>
+          <h2 class="kpi-label mono">INBOUND PROBES (INFERRED)</h2>
           <span class="kpi-badge badge-probe mono" id="kpiProbePct">0.0%</span>
         </div>
         <div class="kpi-value mono" id="kpiProbes" aria-live="polite">0</div>
@@ -146,7 +151,7 @@
           <div class="panel-header">
             <div>
               <h2 class="panel-title" id="timelineHeading">Perimeter Drop Timeline</h2>
-              <p class="panel-sub">Classified by Probes, ICMP Pings, Unsolicited Other, and Stale Return traffic</p>
+              <p class="panel-sub">IPv4 iptables telemetry · Heuristic labels inferred from ports, protocols &amp; TCP flags (raw events always preserved)</p>
             </div>
             <div class="legend" aria-hidden="true">
               <span class="legend-item"><i class="sw sw-probe"></i>Probe</span>
@@ -207,7 +212,7 @@
               <thead>
                 <tr>
                   <th scope="col">Time</th>
-                  <th scope="col">Category</th>
+                  <th scope="col" title="Heuristic classification inferred from packet ports, protocol, TCP flags, and interface; raw log events are preserved">Category (Inferred)</th>
                   <th scope="col">Proto</th>
                   <th scope="col">Source IP : Port</th>
                   <th scope="col">Target Port / Service</th>

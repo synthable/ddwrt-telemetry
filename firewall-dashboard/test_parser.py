@@ -66,11 +66,47 @@ class TestFirewallParser(unittest.TestCase):
     def test_iptables_counters(self) -> None:
         c = parse_iptables_counters(SAMPLE_IPTABLES)
         self.assertEqual(c["wan_ssh_22"]["pkts"], 1949)
+        self.assertTrue(c["wan_ssh_22"]["available"])
         self.assertEqual(c["wan_ssh_2222"]["pkts"], 309)
         self.assertEqual(c["wan_psd"]["pkts"], 3625)
         self.assertEqual(c["wan_icmp"]["pkts"], 1980)
         self.assertEqual(c["invalid_drop"]["pkts"], 5118)
         self.assertEqual(c["tarpit_tcp"]["pkts"], 129000)
+
+    def test_non_wan_interface_classification_and_counters(self) -> None:
+        for iface in ("eth0", "vlan2", "ppp0"):
+            with self.subTest(wan_iface=iface):
+                lines = [
+                    f"Nov 22 00:23:57.987 router kern.info kernel: [1795335837.987176] ACCEPT IN=br0 OUT={iface} SRC=192.168.1.60 DST=203.0.113.44 LEN=60 TTL=63 ID=1 PROTO=TCP SPT=53088 DPT=443 SYN",
+                    "Nov 22 00:23:58.987 router kern.info kernel: [1795335838.987176] ACCEPT IN=br0 OUT= SRC=192.168.1.60 DST=192.168.1.1 LEN=60 TTL=64 ID=2 PROTO=TCP SPT=53089 DPT=2222 SYN",
+                ]
+                evs = parse_lines(lines, {"192.168.1.60": "laptop"}, wan_iface=iface)
+                self.assertEqual(len(evs), 2)
+                self.assertEqual(evs[0].category, "outbound")
+                self.assertEqual(evs[1].category, "local")
+
+        non_wan_iptables = """
+Chain INPUT (policy ACCEPT 0 packets, 0 bytes)
+ pkts bytes target     prot opt in     out     source               destination
+    0     0 DROP       tcp  --  ppp0   *       0.0.0.0/0            0.0.0.0/0            tcp dpt:22
+  420 21840 logdrop    icmp --  ppp0   *       0.0.0.0/0            0.0.0.0/0
+""".strip()
+        counters = parse_iptables_counters(non_wan_iptables, wan_iface="ppp0")
+        # Measured 0 is available=True with pkts=0
+        self.assertTrue(counters["wan_ssh_22"]["available"])
+        self.assertEqual(counters["wan_ssh_22"]["pkts"], 0)
+        # Matched non-zero counter on ppp0
+        self.assertTrue(counters["wan_icmp"]["available"])
+        self.assertEqual(counters["wan_icmp"]["pkts"], 420)
+        # Unmatched counters are clearly unavailable (not 0)
+        self.assertFalse(counters["wan_ssh_2222"]["available"])
+        self.assertIsNone(counters["wan_ssh_2222"]["pkts"])
+        self.assertFalse(counters["tarpit_tcp"]["available"])
+        self.assertIsNone(counters["tarpit_tcp"]["pkts"])
+
+        # Empty snapshot marks all counters unavailable
+        empty = parse_iptables_counters("", wan_iface="eth0")
+        self.assertTrue(all(not item["available"] and item["pkts"] is None for item in empty.values()))
 
 
 if __name__ == "__main__":

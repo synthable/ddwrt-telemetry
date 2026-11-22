@@ -65,3 +65,45 @@ func TestParseAndFormatTCP(t *testing.T) {
 		}
 	}
 }
+
+func TestParseDefaultRouteIface(t *testing.T) {
+	cases := []struct {
+		name string
+		out  string
+		want string
+	}{
+		{
+			name: "standard eth0",
+			out:  "default via 203.0.113.1 dev eth0 proto static\n",
+			want: "eth0",
+		},
+		{
+			name: "pppoe ppp0",
+			out:  "default dev ppp0 scope link\n",
+			want: "ppp0",
+		},
+		{
+			name: "vlan2 with metric",
+			out:  "default via 198.51.100.1 dev vlan2 metric 100\ndefault via 192.0.2.1 dev eth1 metric 200\n",
+			want: "vlan2",
+		},
+		{
+			name: "empty output",
+			out:  "",
+			want: "",
+		},
+		{
+			name: "non-default route ignored",
+			out:  "192.168.1.0/24 dev br0 proto kernel scope link src 192.168.1.1\n",
+			want: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseDefaultRouteIface(tc.out); got != tc.want {
+				t.Fatalf("parseDefaultRouteIface(%q) = %q; want %q", tc.out, got, tc.want)
+			}
+		})
+	}
+}
