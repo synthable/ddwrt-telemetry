@@ -35,30 +35,45 @@ ensure_nflogd() {
   pidof nflogd >/dev/null 2>&1 || ("$NFLOGD_BIN" </dev/null >/dev/null 2>&1 &)
 }
 
-# Preserve any leftover .rot from a prior failed archive run before rotating a fresh live log,
-# while capping .prev at 2 * MAX_RAM_KB so repeated archive failures cannot exhaust /tmp RAM.
+# Preserve any leftover .rot from a prior failed archive run before rotating a fresh live log.
 rotate_live_log() {
   SRC="$1"
   [ -s "$SRC" ] || return 1
   if [ -s "${SRC}.rot" ]; then
     if cat "${SRC}.rot" >> "${SRC}.prev"; then
       rm -f "${SRC}.rot"
-      MAX_PREV_BYTES=$((MAX_RAM_KB * 2048))
-      PREV_BYTES=$(wc -c < "${SRC}.prev" 2>/dev/null | tr -d ' ')
-      if [ -n "$PREV_BYTES" ] && [ "$PREV_BYTES" -gt "$MAX_PREV_BYTES" ]; then
-        CAP_TMP="${SRC}.prev.cap.$$"
-        if tail -c "$MAX_PREV_BYTES" "${SRC}.prev" > "$CAP_TMP" 2>/dev/null; then
-          mv -f "$CAP_TMP" "${SRC}.prev"
-        else
-          rm -f "$CAP_TMP"
-        fi
-      fi
     else
       echo "archive-logs: failed to merge prior ${SRC}.rot into ${SRC}.prev; skipping rotation" >&2
       return 1
     fi
   fi
   mv "$SRC" "${SRC}.rot"
+}
+
+# Rotate live DNS log during hourly ramcheck: if a prior ramcheck archive failed and left
+# .rot pending, merge .rot into .prev and bound .prev at 2 * MAX_RAM_KB so repeated
+# ramcheck failures cannot exhaust /tmp RAM. Daily rotation uses rotate_live_log (uncapped).
+rotate_dns_for_ramcheck() {
+  [ -s "$DNS_LOG" ] || return 1
+  if [ -s "${DNS_LOG}.rot" ]; then
+    if cat "${DNS_LOG}.rot" >> "${DNS_LOG}.prev"; then
+      rm -f "${DNS_LOG}.rot"
+      MAX_PREV_BYTES=$((MAX_RAM_KB * 2048))
+      PREV_BYTES=$(wc -c < "${DNS_LOG}.prev" 2>/dev/null | tr -d ' ')
+      if [ -n "$PREV_BYTES" ] && [ "$PREV_BYTES" -gt "$MAX_PREV_BYTES" ]; then
+        CAP_TMP="${DNS_LOG}.prev.cap.$$"
+        if tail -c "$MAX_PREV_BYTES" "${DNS_LOG}.prev" > "$CAP_TMP" 2>/dev/null; then
+          mv -f "$CAP_TMP" "${DNS_LOG}.prev"
+        else
+          rm -f "$CAP_TMP"
+        fi
+      fi
+    else
+      echo "archive-logs: failed to merge prior ${DNS_LOG}.rot into ${DNS_LOG}.prev; skipping rotation" >&2
+      return 1
+    fi
+  fi
+  mv "$DNS_LOG" "${DNS_LOG}.rot"
 }
 
 # Compress non-empty source files to a temp archive, verify gzip integrity, and atomically move into place.
@@ -146,7 +161,7 @@ case "$1" in
       fi
       # .prev or .rot already exists: rotate live log to .rot (preserving any prior .rot into .prev)
       # so neither old nor new records are lost if archival fails.
-      if rotate_live_log "$DNS_LOG"; then
+      if rotate_dns_for_ramcheck; then
         reopen_dnsmasq
       else
         exit 1

@@ -126,16 +126,31 @@ ensure_rule_before_terminal() {
 }
 
 record_stock_log_backup() {
-  ENTRY="$1"
+  CHAIN_ARG="$1"
+  ORIG_POS_ARG="$2"
+  KIND_ARG="$3"
+  PFX_ARG="$4"
+  ENTRY="${CHAIN_ARG}|${ORIG_POS_ARG}|${KIND_ARG}|${PFX_ARG}"
   if [ -f "$BACKUP_FILE" ] && grep -Fqx "$ENTRY" "$BACKUP_FILE" 2>/dev/null; then
     return 0
   fi
   printf '%s\n' "$ENTRY" >> "$BACKUP_FILE"
 }
 
+count_saved_stock_logs_for_chain() {
+  CHAIN_ARG="$1"
+  [ -f "$BACKUP_FILE" ] || { echo 0; return 0; }
+  awk -F'|' -v c="$CHAIN_ARG" '$1 == c { n++ } END { print n + 0 }' "$BACKUP_FILE"
+}
+
+chain_rule_count() {
+  "$IPTABLES_BIN" -L "$1" -n --line-numbers 2>/dev/null | \
+    awk '$1 ~ /^[0-9]+$/ { n = $1 } END { print n + 0 }'
+}
+
 # Remove unfiltered stock DD-WRT LOG rules matching the exact prefix so kernel syslog isn't flooded,
-# recording each removed stock rule in BACKUP_FILE so rollback restores the exact original chain.
-# Custom LOG rules (even those sharing a stock prefix) are never matched or removed.
+# recording each removed stock rule and its original 1-based position in BACKUP_FILE so rollback
+# restores the exact original chain ordering even when custom rules are interleaved after stock rules.
 remove_stock_log_rules() {
   CHAIN="$1"
   PFX="$2"
@@ -145,8 +160,10 @@ remove_stock_log_rules() {
     [ -n "$FOUND" ] || break
     N=${FOUND%%|*}
     KIND=${FOUND#*|}
-    record_stock_log_backup "${CHAIN}|${KIND}|${PFX}" || return 1
+    PRIOR=$(count_saved_stock_logs_for_chain "$CHAIN")
+    ORIG_POS=$((N + PRIOR))
     "$IPTABLES_BIN" -D "$CHAIN" "$N" || return 1
+    record_stock_log_backup "$CHAIN" "$ORIG_POS" "$KIND" "$PFX" || return 1
   done
   return 0
 }
@@ -162,21 +179,34 @@ remove_nflog_rule() {
   return 0
 }
 
+insert_rule_at_pos() {
+  CHAIN="$1"
+  POS="$2"
+  shift 2
+  MAX_POS=$(( $(chain_rule_count "$CHAIN") + 1 ))
+  if [ "$POS" -lt 1 ] 2>/dev/null; then
+    POS=1
+  elif [ "$POS" -gt "$MAX_POS" ] 2>/dev/null; then
+    POS="$MAX_POS"
+  fi
+  "$IPTABLES_BIN" -I "$CHAIN" "$POS" "$@"
+}
+
 restore_saved_stock_logs() {
   [ -f "$BACKUP_FILE" ] || return 0
   RC_RESTORE=0
-  while IFS='|' read -r CHAIN KIND PFX; do
+  while IFS='|' read -r CHAIN ORIG_POS KIND PFX; do
     [ -n "$CHAIN" ] || continue
     chain_exists "$CHAIN" || continue
     case "$KIND" in
       NEW)
-        ensure_rule_before_terminal "$CHAIN" -m state --state NEW -j LOG --log-prefix "$PFX" || RC_RESTORE=1
+        insert_rule_at_pos "$CHAIN" "$ORIG_POS" -m state --state NEW -j LOG --log-prefix "$PFX" || RC_RESTORE=1
         ;;
       INVALID)
-        ensure_rule_before_terminal "$CHAIN" -m state --state INVALID -j LOG --log-prefix "$PFX" || RC_RESTORE=1
+        insert_rule_at_pos "$CHAIN" "$ORIG_POS" -m state --state INVALID -j LOG --log-prefix "$PFX" || RC_RESTORE=1
         ;;
       NONE)
-        ensure_rule_before_terminal "$CHAIN" -j LOG --log-prefix "$PFX" || RC_RESTORE=1
+        insert_rule_at_pos "$CHAIN" "$ORIG_POS" -j LOG --log-prefix "$PFX" || RC_RESTORE=1
         ;;
     esac
   done < "$BACKUP_FILE"
@@ -185,14 +215,14 @@ restore_saved_stock_logs() {
 
 rollback_rules() {
   RC=0
-  restore_saved_stock_logs || RC=1
-
   remove_nflog_rule logaccept -m state --state NEW -j NFLOG --nflog-group 1 --nflog-prefix "ACCEPT " || RC=1
   remove_nflog_rule logdrop -m state --state NEW -j NFLOG --nflog-group 2 --nflog-prefix "DROP " || RC=1
   remove_nflog_rule logdrop -m state --state INVALID -j NFLOG --nflog-group 2 --nflog-prefix "DROP " || RC=1
   remove_nflog_rule logreject -j NFLOG --nflog-group 2 --nflog-prefix "REJECT " || RC=1
   remove_nflog_rule logreject_tcp -j NFLOG --nflog-group 2 --nflog-prefix "REJECT " || RC=1
   remove_nflog_rule portscan -j NFLOG --nflog-group 2 --nflog-prefix "portscan:" || RC=1
+
+  restore_saved_stock_logs || RC=1
 
   if chain_exists logbrute; then
     N=$(find_nflog_line logbrute 2 "[DROP BRUTEFORCE] : ")

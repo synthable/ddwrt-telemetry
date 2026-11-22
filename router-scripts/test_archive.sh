@@ -227,4 +227,24 @@ if [ "$PREV_BYTES" -gt 2048 ]; then
   exit 1
 fi
 
+# 4e) Daily recovery must NOT truncate pending firewall logs even when MAX_RAM_KB=1
+FW_RECOVERY_DIR="${TMP_ROOT}/jffs/fw-recovery-logs"
+mkdir -p "$FW_RECOVERY_DIR"
+rm -f "${DNS_LOG}" "${DNS_LOG}.prev" "${DNS_LOG}.rot"
+python3 -c 'print("DROP-ROT " + "R" * 5120)' > "${FW_DROP_LOG}.rot"
+python3 -c 'print("DROP-LIVE " + "L" * 1024)' > "${FW_DROP_LOG}"
+EXPECTED_FW_BYTES=$(( $(wc -c < "${FW_DROP_LOG}.rot" | tr -d ' ') + $(wc -c < "${FW_DROP_LOG}" | tr -d ' ') ))
+
+LOG_DIR="$FW_RECOVERY_DIR" DNS_LOG="$DNS_LOG" FW_ACCEPT_LOG="$FW_ACCEPT_LOG" \
+  FW_DROP_LOG="$FW_DROP_LOG" SYSLOG_DIR="$SYSLOG_DIR" JFFS_MOUNT="${TMP_ROOT}/no-jffs" \
+  GZIP_BIN=gzip SKIP_SIGNALS=1 MAX_RAM_KB=1 MAX_JFFS_PCT=100 \
+  sh "$ARCHIVE_SCRIPT"
+
+FW_REC_ARCH=$(ls "${FW_RECOVERY_DIR}"/fw-drop-*.log.gz | head -n 1)
+ACTUAL_FW_BYTES=$(gzip -dc "$FW_REC_ARCH" | wc -c | tr -d ' ')
+if [ "$ACTUAL_FW_BYTES" -ne "$EXPECTED_FW_BYTES" ]; then
+  echo "FAIL: daily firewall recovery truncated bytes ($ACTUAL_FW_BYTES != $EXPECTED_FW_BYTES)" >&2
+  exit 1
+fi
+
 echo "PASS: archive-logs.sh verified (failure preservation, corruption rejection, retry recovery, ramcheck failure visibility + recovery + RAM cap)"

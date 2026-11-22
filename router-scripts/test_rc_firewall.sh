@@ -246,9 +246,11 @@ init_state() {
     ],
     "logdrop": [
       {"target": "ACCEPT", "spec": ["-s", "192.168.1.50", "-j", "ACCEPT"]},
-      {"target": "LOG", "spec": ["-s", "192.168.1.77", "-j", "LOG", "--log-prefix", "DROP "]},
-      {"target": "LOG", "spec": ["-s", "192.168.1.88", "-j", "LOG", "--log-prefix", "CUSTOM_AUDIT "]},
       {"target": "LOG", "spec": ["-m", "state", "--state", "NEW", "-j", "LOG", "--log-prefix", "DROP "]},
+      {"target": "LOG", "spec": ["-s", "192.168.1.77", "-j", "LOG", "--log-prefix", "DROP "]},
+      {"target": "ACCEPT", "spec": ["-s", "192.168.1.60", "-j", "ACCEPT"]},
+      {"target": "LOG", "spec": ["-s", "192.168.1.88", "-j", "LOG", "--log-prefix", "CUSTOM_AUDIT "]},
+      {"target": "LOG", "spec": ["-m", "state", "--state", "INVALID", "-j", "LOG", "--log-prefix", "DROP "]},
       {"target": "DROP", "spec": ["-j", "DROP"]}
     ],
     "logreject": [
@@ -303,7 +305,7 @@ import json, sys
 s = json.loads(open(sys.argv[1]).read())
 assert not any(k.startswith("nflog_probe_") for k in s["chains"]), f"probe chain leaked: {list(s['chains'])}"
 assert s["meta"]["flushed_live"] == [], f"live chains flushed: {s['meta']['flushed_live']}"
-assert len(s["chains"]["logdrop"]) == 5, f"logdrop mutated on failed probe: {s['chains']['logdrop']}"
+assert len(s["chains"]["logdrop"]) == 7, f"logdrop mutated on failed probe: {s['chains']['logdrop']}"
 PYEOF
 
 # --- Test 3: Install + idempotent re-run preserve filtered custom LOG rules sharing stock prefixes ---
@@ -332,11 +334,12 @@ assert len(c["logaccept"]) == 4
 
 assert c["logdrop"][0]["spec"] == ["-s", "192.168.1.50", "-j", "ACCEPT"]
 assert c["logdrop"][1]["spec"] == ["-s", "192.168.1.77", "-j", "LOG", "--log-prefix", "DROP "]
-assert c["logdrop"][2]["spec"] == ["-s", "192.168.1.88", "-j", "LOG", "--log-prefix", "CUSTOM_AUDIT "]
-assert c["logdrop"][3]["spec"] == ["-m", "state", "--state", "NEW", "-j", "NFLOG", "--nflog-group", "2", "--nflog-prefix", "DROP "]
-assert c["logdrop"][4]["spec"] == ["-m", "state", "--state", "INVALID", "-j", "NFLOG", "--nflog-group", "2", "--nflog-prefix", "DROP "]
-assert c["logdrop"][5]["spec"] == ["-j", "DROP"]
-assert len(c["logdrop"]) == 6
+assert c["logdrop"][2]["spec"] == ["-s", "192.168.1.60", "-j", "ACCEPT"]
+assert c["logdrop"][3]["spec"] == ["-s", "192.168.1.88", "-j", "LOG", "--log-prefix", "CUSTOM_AUDIT "]
+assert c["logdrop"][4]["spec"] == ["-m", "state", "--state", "NEW", "-j", "NFLOG", "--nflog-group", "2", "--nflog-prefix", "DROP "]
+assert c["logdrop"][5]["spec"] == ["-m", "state", "--state", "INVALID", "-j", "NFLOG", "--nflog-group", "2", "--nflog-prefix", "DROP "]
+assert c["logdrop"][6]["spec"] == ["-j", "DROP"]
+assert len(c["logdrop"]) == 7
 
 # logbrute: custom group-99 NFLOG stays untouched at index 0, telemetry group-2 NFLOG replaces stock LOG at index 1
 assert c["logbrute"][0]["spec"] == ["-s", "10.0.0.0/8", "-j", "NFLOG", "--nflog-group", "99", "--nflog-prefix", "CUSTOM_TAP "]
@@ -373,9 +376,10 @@ assert c["logaccept"][0]["spec"] == ["-s", "192.168.1.250", "-j", "RETURN"]
 assert c["logaccept"][1]["spec"] == ["-p", "tcp", "--dport", "8443", "-j", "LOG", "--log-prefix", "ACCEPT "]
 assert c["logaccept"][-1]["target"] == "ACCEPT"
 assert c["logdrop"][0]["spec"] == ["-s", "192.168.1.50", "-j", "ACCEPT"]
-assert c["logdrop"][1]["spec"] == ["-s", "192.168.1.77", "-j", "LOG", "--log-prefix", "DROP "]
-assert c["logdrop"][2]["spec"] == ["-s", "192.168.1.88", "-j", "LOG", "--log-prefix", "CUSTOM_AUDIT "]
 assert c["logdrop"][-1]["target"] == "DROP"
+assert any(r["spec"] == ["-s", "192.168.1.77", "-j", "LOG", "--log-prefix", "DROP "] for r in c["logdrop"])
+assert any(r["spec"] == ["-s", "192.168.1.60", "-j", "ACCEPT"] for r in c["logdrop"])
+assert any(r["spec"] == ["-s", "192.168.1.88", "-j", "LOG", "--log-prefix", "CUSTOM_AUDIT "] for r in c["logdrop"])
 assert c["logreject"][-1]["target"] == "REJECT"
 assert c["logreject_tcp"][-1]["target"] == "REJECT"
 assert c["portscan"][0]["spec"] == ["-s", "192.168.1.99", "-j", "RETURN"]
