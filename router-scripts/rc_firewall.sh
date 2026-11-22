@@ -6,9 +6,9 @@
 # Scope: Configures IPv4 iptables chains only (IPv6 ip6tables is not modified).
 # Safety: Checks kernel nfnetlink_log + iptables NFLOG support before modifying any chain,
 # preserves custom user rules (including filtered custom LOG rules sharing a stock prefix)
-# and terminal verdicts without flushing live chains, records removed unfiltered stock
-# DD-WRT LOG rules so rollback restores the exact ordered rule set, and supports safe
-# removal via:
+# and terminal verdicts without flushing live chains, snapshots all unfiltered stock
+# DD-WRT LOG rules (including duplicate instances and exact positions) to BACKUP_FILE
+# before deleting them, and supports exact restoration via:
 #   rc_firewall.sh rollback
 
 IPTABLES_BIN="${IPTABLES_BIN:-iptables}"
@@ -60,11 +60,11 @@ find_terminal_pos() {
     '
 }
 
-# Locate the first unfiltered stock DD-WRT LOG rule in CHAIN matching the exact log prefix.
-# Returns "<line_num>|<state_kind>" where state_kind is NEW, INVALID, or NONE.
+# List all unfiltered stock DD-WRT LOG rules in CHAIN matching the exact log prefix.
+# Outputs one "<line_num>|<state_kind>" line per occurrence (state_kind: NEW, INVALID, or NONE).
 # Never matches a custom LOG rule that specifies source/destination IPs, interfaces,
 # protocols, ports, or any match criteria other than stock -m state --state NEW|INVALID.
-find_stock_log_rule() {
+list_stock_log_rules() {
   CHAIN="$1"
   PFX="$2"
   "$IPTABLES_BIN" -L "$CHAIN" -n --line-numbers 2>/dev/null | \
@@ -79,16 +79,17 @@ find_stock_log_rule() {
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", pre)
         if (pre == "") {
           print $1 "|NONE"
-          exit
         } else if (pre == "state NEW" || pre == "-m state --state NEW") {
           print $1 "|NEW"
-          exit
         } else if (pre == "state INVALID" || pre == "-m state --state INVALID") {
           print $1 "|INVALID"
-          exit
         }
       }
     '
+}
+
+find_stock_log_rule() {
+  list_stock_log_rules "$1" "$2" | head -n 1
 }
 
 # Locate the exact telemetry NFLOG rule in CHAIN matching both group and prefix.
@@ -125,37 +126,6 @@ ensure_rule_before_terminal() {
   fi
 }
 
-clear_saved_stock_logs_for_chain() {
-  CHAIN_ARG="$1"
-  [ -f "$BACKUP_FILE" ] || return 0
-  TMP_BKP="${BACKUP_FILE}.tmp.$$"
-  awk -F'|' -v c="$CHAIN_ARG" '$1 != c { print $0 }' "$BACKUP_FILE" > "$TMP_BKP" 2>/dev/null && \
-    mv -f "$TMP_BKP" "$BACKUP_FILE" || rm -f "$TMP_BKP"
-}
-
-has_saved_stock_log_kind() {
-  CHAIN_ARG="$1"
-  KIND_ARG="$2"
-  PFX_ARG="$3"
-  [ -f "$BACKUP_FILE" ] || return 1
-  awk -F'|' -v c="$CHAIN_ARG" -v k="$KIND_ARG" -v p="$PFX_ARG" '
-    $1 == c && $3 == k && $4 == p { found = 1; exit }
-    END { exit(found ? 0 : 1) }
-  ' "$BACKUP_FILE"
-}
-
-record_stock_log_backup() {
-  CHAIN_ARG="$1"
-  ORIG_POS_ARG="$2"
-  KIND_ARG="$3"
-  PFX_ARG="$4"
-  ENTRY="${CHAIN_ARG}|${ORIG_POS_ARG}|${KIND_ARG}|${PFX_ARG}"
-  if [ -f "$BACKUP_FILE" ] && grep -Fqx "$ENTRY" "$BACKUP_FILE" 2>/dev/null; then
-    return 0
-  fi
-  printf '%s\n' "$ENTRY" >> "$BACKUP_FILE"
-}
-
 count_saved_stock_logs_for_chain() {
   CHAIN_ARG="$1"
   [ -f "$BACKUP_FILE" ] || { echo 0; return 0; }
@@ -167,9 +137,68 @@ chain_rule_count() {
     awk '$1 ~ /^[0-9]+$/ { n = $1 } END { print n + 0 }'
 }
 
-# Remove unfiltered stock DD-WRT LOG rules matching the exact prefix so kernel syslog isn't flooded,
-# recording each removed stock rule and its original 1-based position in BACKUP_FILE so rollback
-# restores the exact original chain ordering even when custom rules are interleaved after stock rules.
+# Atomically snapshot all unfiltered stock LOG rules in CHAIN (preserving duplicate instances
+# and exact 1-based positions) into BACKUP_FILE BEFORE modifying CHAIN.
+# If BACKUP_FILE is unwritable, returns non-zero before any rule is inserted or deleted.
+snapshot_stock_logs_for_chain() {
+  CHAIN="$1"
+  GRP="$2"
+  NFLOG_PFX="$3"
+  STOCK_PFX="$4"
+  chain_exists "$CHAIN" || return 0
+
+  HAS_NFLOG=$(find_nflog_line "$CHAIN" "$GRP" "$NFLOG_PFX")
+  SAVED_COUNT=$(count_saved_stock_logs_for_chain "$CHAIN")
+
+  # If the chain already has our telemetry NFLOG rule and BACKUP_FILE already holds
+  # saved stock rules for this chain, keep the existing baseline snapshot (ordinary rerun
+  # or resume after mid-chain interruption), but verify BACKUP_FILE remains writable.
+  if [ -n "$HAS_NFLOG" ] && [ "$SAVED_COUNT" -gt 0 ]; then
+    ( : >> "$BACKUP_FILE" ) 2>/dev/null || {
+      echo "rc_firewall: backup file ${BACKUP_FILE} is not writable" >&2
+      return 1
+    }
+    return 0
+  fi
+
+  RULES=$(list_stock_log_rules "$CHAIN" "$STOCK_PFX")
+  TMP_BKP="${BACKUP_FILE}.tmp.$$"
+  rm -f "$TMP_BKP"
+
+  if [ -f "$BACKUP_FILE" ]; then
+    awk -F'|' -v c="$CHAIN" '$1 != c { print $0 }' "$BACKUP_FILE" > "$TMP_BKP" 2>/dev/null || {
+      rm -f "$TMP_BKP"
+      echo "rc_firewall: unable to stage backup file ${TMP_BKP}" >&2
+      return 1
+    }
+  else
+    ( : > "$TMP_BKP" ) 2>/dev/null || {
+      echo "rc_firewall: unable to create backup file ${TMP_BKP}" >&2
+      return 1
+    }
+  fi
+
+  if [ -n "$RULES" ]; then
+    printf '%s\n' "$RULES" | while IFS='|' read -r POS KIND; do
+      [ -n "$POS" ] || continue
+      printf '%s|%s|%s|%s\n' "$CHAIN" "$POS" "$KIND" "$STOCK_PFX"
+    done >> "$TMP_BKP" 2>/dev/null || {
+      rm -f "$TMP_BKP"
+      echo "rc_firewall: failed writing stock LOG backup to ${TMP_BKP}" >&2
+      return 1
+    }
+  fi
+
+  mv -f "$TMP_BKP" "$BACKUP_FILE" 2>/dev/null || {
+    rm -f "$TMP_BKP"
+    echo "rc_firewall: unable to commit backup file ${BACKUP_FILE}" >&2
+    return 1
+  }
+  return 0
+}
+
+# Remove unfiltered stock DD-WRT LOG rules matching the exact prefix after they have been
+# safely snapshotted in BACKUP_FILE. Custom LOG rules are never matched or removed.
 remove_stock_log_rules() {
   CHAIN="$1"
   PFX="$2"
@@ -178,16 +207,7 @@ remove_stock_log_rules() {
     FOUND=$(find_stock_log_rule "$CHAIN" "$PFX")
     [ -n "$FOUND" ] || break
     N=${FOUND%%|*}
-    KIND=${FOUND#*|}
-    # If this stock rule kind is already recorded in BACKUP_FILE, the chain was rebuilt by DD-WRT
-    # since the last run; clear stale entries for this chain before recording fresh positions.
-    if has_saved_stock_log_kind "$CHAIN" "$KIND" "$PFX"; then
-      clear_saved_stock_logs_for_chain "$CHAIN"
-    fi
-    PRIOR=$(count_saved_stock_logs_for_chain "$CHAIN")
-    ORIG_POS=$((N + PRIOR))
     "$IPTABLES_BIN" -D "$CHAIN" "$N" || return 1
-    record_stock_log_backup "$CHAIN" "$ORIG_POS" "$KIND" "$PFX" || return 1
   done
   return 0
 }
@@ -207,9 +227,6 @@ insert_rule_at_pos() {
   CHAIN="$1"
   POS="$2"
   shift 2
-  if "$IPTABLES_BIN" -C "$CHAIN" "$@" 2>/dev/null; then
-    return 0
-  fi
   MAX_POS=$(( $(chain_rule_count "$CHAIN") + 1 ))
   if [ "$POS" -lt 1 ] 2>/dev/null; then
     POS=1
@@ -222,6 +239,18 @@ insert_rule_at_pos() {
 restore_saved_stock_logs() {
   [ -f "$BACKUP_FILE" ] || return 0
   RC_RESTORE=0
+
+  # For each chain that has saved entries in BACKUP_FILE, remove any remaining partial
+  # unfiltered stock LOG rules (e.g., if an earlier install was interrupted mid-deletion)
+  # before re-inserting the complete saved set at their exact original 1-based positions.
+  for CHAIN_PAIR in "logaccept:ACCEPT " "logdrop:DROP " "logreject:REJECT " "logreject_tcp:REJECT " "portscan:portscan:"; do
+    C_NAME=${CHAIN_PAIR%%:*}
+    C_PFX=${CHAIN_PAIR#*:}
+    if [ "$(count_saved_stock_logs_for_chain "$C_NAME")" -gt 0 ] && chain_exists "$C_NAME"; then
+      remove_stock_log_rules "$C_NAME" "$C_PFX" || RC_RESTORE=1
+    fi
+  done
+
   while IFS='|' read -r CHAIN ORIG_POS KIND PFX; do
     [ -n "$CHAIN" ] || continue
     chain_exists "$CHAIN" || continue
@@ -285,28 +314,26 @@ if [ "$SKIP_DAEMON" != "1" ]; then
     ("$NFLOGD_BIN" -http-listen "$NFLOGD_LISTEN" -tz "$NFLOGD_TZ" </dev/null >/dev/null 2>&1 &)
 fi
 
-# Apply NFLOG rules in-place without flushing chains or removing custom/terminal rules,
-# then record and remove unfiltered stock DD-WRT LOG rules so dmesg/syslog stays clean.
-# If a chain lacks our telemetry NFLOG rule at entry, DD-WRT rebuilt the chain (or this is
-# a fresh install), so clear any stale saved stock LOG entries for that chain first.
-[ -z "$(find_nflog_line logaccept 1 "ACCEPT ")" ] && clear_saved_stock_logs_for_chain logaccept
+# Snapshot each chain's unfiltered stock LOG rules to BACKUP_FILE BEFORE modifying the chain,
+# insert telemetry NFLOG rules before the terminal verdict, and then remove the stock LOG rules.
+snapshot_stock_logs_for_chain logaccept 1 "ACCEPT " "ACCEPT " || exit 1
 ensure_rule_before_terminal logaccept -m state --state NEW -j NFLOG --nflog-group 1 --nflog-prefix "ACCEPT " || exit 1
 remove_stock_log_rules logaccept "ACCEPT " || exit 1
 
-[ -z "$(find_nflog_line logdrop 2 "DROP ")" ] && clear_saved_stock_logs_for_chain logdrop
+snapshot_stock_logs_for_chain logdrop 2 "DROP " "DROP " || exit 1
 ensure_rule_before_terminal logdrop -m state --state NEW -j NFLOG --nflog-group 2 --nflog-prefix "DROP " || exit 1
 ensure_rule_before_terminal logdrop -m state --state INVALID -j NFLOG --nflog-group 2 --nflog-prefix "DROP " || exit 1
 remove_stock_log_rules logdrop "DROP " || exit 1
 
-[ -z "$(find_nflog_line logreject 2 "REJECT ")" ] && clear_saved_stock_logs_for_chain logreject
+snapshot_stock_logs_for_chain logreject 2 "REJECT " "REJECT " || exit 1
 ensure_rule_before_terminal logreject -j NFLOG --nflog-group 2 --nflog-prefix "REJECT " || exit 1
 remove_stock_log_rules logreject "REJECT " || exit 1
 
-[ -z "$(find_nflog_line logreject_tcp 2 "REJECT ")" ] && clear_saved_stock_logs_for_chain logreject_tcp
+snapshot_stock_logs_for_chain logreject_tcp 2 "REJECT " "REJECT " || exit 1
 ensure_rule_before_terminal logreject_tcp -j NFLOG --nflog-group 2 --nflog-prefix "REJECT " || exit 1
 remove_stock_log_rules logreject_tcp "REJECT " || exit 1
 
-[ -z "$(find_nflog_line portscan 2 "portscan:")" ] && clear_saved_stock_logs_for_chain portscan
+snapshot_stock_logs_for_chain portscan 2 "portscan:" "portscan:" || exit 1
 ensure_rule_before_terminal portscan -j NFLOG --nflog-group 2 --nflog-prefix "portscan:" || exit 1
 remove_stock_log_rules portscan "portscan:" || exit 1
 

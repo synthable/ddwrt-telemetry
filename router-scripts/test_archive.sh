@@ -213,12 +213,28 @@ for REC in old-ramcheck.example.com new-ramcheck.example.com; do
   esac
 done
 
-# 4d) Verify RAM cap under repeated archive failures (cannot grow without bound)
+# 4d) Verify line-safe RAM cap, visible loss accounting, and record integrity after recovery
+rm -f "${RAM_LOG_DIR}/"*.log.gz "${RAM_DNS}" "${RAM_DNS}.prev" "${RAM_DNS}.rot"
+STDERR_LOG="${TMP_ROOT}/ramcheck-overflow.stderr"
+: > "$STDERR_LOG"
+TOTAL_GENERATED_RECS=0
+TOTAL_GENERATED_BYTES=0
+
 for BATCH in 1 2 3 4 5; do
-  python3 -c "print('Nov 22 03:00:0${BATCH} dnsmasq[1]: query[A] batch-${BATCH}.example.com from 192.168.1.10\n' + '# ' + 'X' * 2048)" > "$RAM_DNS"
+  python3 - "$BATCH" > "$RAM_DNS" <<'PYEOF'
+import sys
+b = sys.argv[1]
+for i in range(1, 16):
+    print(f"Nov 22 03:0{b}:{i:02d} dnsmasq[1]: query[A] batch-{b}-rec-{i:02d}.example.com from 192.168.1.10")
+PYEOF
+  BATCH_LINES=$(wc -l < "$RAM_DNS" | tr -d ' ')
+  BATCH_BYTES=$(wc -c < "$RAM_DNS" | tr -d ' ')
+  TOTAL_GENERATED_RECS=$((TOTAL_GENERATED_RECS + BATCH_LINES))
+  TOTAL_GENERATED_BYTES=$((TOTAL_GENERATED_BYTES + BATCH_BYTES))
+
   LOG_DIR="$RAM_LOG_DIR" DNS_LOG="$RAM_DNS" JFFS_MOUNT="${TMP_ROOT}/no-jffs" \
     GZIP_BIN="$FAIL_GZIP" SKIP_SIGNALS=1 MAX_RAM_KB=1 MAX_JFFS_PCT=100 \
-    sh "$ARCHIVE_SCRIPT" ramcheck 2>/dev/null || true
+    sh "$ARCHIVE_SCRIPT" ramcheck 2>>"$STDERR_LOG" || true
 done
 
 PREV_BYTES=$(wc -c < "${RAM_DNS}.prev" | tr -d ' ')
@@ -226,6 +242,64 @@ if [ "$PREV_BYTES" -gt 2048 ]; then
   echo "FAIL: repeated failed ramcheck runs exceeded 2*MAX_RAM_KB cap ($PREV_BYTES > 2048)" >&2
   exit 1
 fi
+
+if ! grep -q "RAM_CAP_OVERFLOW" "$STDERR_LOG"; then
+  echo "FAIL: expected RAM_CAP_OVERFLOW warning on stderr when RAM cap trimmed old lines" >&2
+  exit 1
+fi
+
+# Now recover with working gzip and verify:
+#  - In-band RAM_CAP_OVERFLOW header reports exact discarded_records and discarded_bytes
+#  - Multiple recent batches survive (not just batch 5)
+#  - Every surviving DNS line is a complete, unsplit record
+LOG_DIR="$RAM_LOG_DIR" DNS_LOG="$RAM_DNS" JFFS_MOUNT="${TMP_ROOT}/no-jffs" \
+  GZIP_BIN=gzip SKIP_SIGNALS=1 MAX_RAM_KB=1 MAX_JFFS_PCT=100 \
+  sh "$ARCHIVE_SCRIPT" ramcheck
+
+OVERFLOW_ARCH=$(ls "${RAM_LOG_DIR}"/dns-*.log.gz | head -n 1)
+gzip -t "$OVERFLOW_ARCH"
+
+python3 - "$OVERFLOW_ARCH" "$TOTAL_GENERATED_RECS" "$TOTAL_GENERATED_BYTES" <<'PYEOF'
+import gzip, re, sys
+
+arch_path = sys.argv[1]
+total_recs = int(sys.argv[2])
+total_bytes = int(sys.argv[3])
+
+with gzip.open(arch_path, "rt", encoding="utf-8") as fh:
+    lines = fh.readlines()
+
+assert lines, "recovered archive is empty"
+hdr = lines[0].rstrip("\n")
+m = re.match(
+    r"^# archive-logs: RAM_CAP_OVERFLOW discarded_records=(\d+) discarded_bytes=(\d+) max_prev_bytes=2048$",
+    hdr,
+)
+assert m, f"missing or malformed overflow header in recovered archive: {hdr!r}"
+disc_recs = int(m.group(1))
+disc_bytes = int(m.group(2))
+
+surviving = lines[1:]
+assert disc_recs > 0 and disc_bytes > 0, f"expected positive discard counts, got {disc_recs}, {disc_bytes}"
+assert disc_recs + len(surviving) == total_recs, (
+    f"discarded_records ({disc_recs}) + surviving ({len(surviving)}) != total ({total_recs})"
+)
+surviving_bytes = sum(len(x.encode("utf-8")) for x in surviving)
+assert disc_bytes + surviving_bytes == total_bytes, (
+    f"discarded_bytes ({disc_bytes}) + surviving_bytes ({surviving_bytes}) != total_bytes ({total_bytes})"
+)
+
+line_re = re.compile(
+    r"^Nov 22 03:0([1-5]):\d{2} dnsmasq\[1\]: query\[A\] batch-([1-5])-rec-\d{2}\.example\.com from 192\.168\.1\.10\n$"
+)
+batches_seen = set()
+for idx, line in enumerate(surviving, start=2):
+    lm = line_re.match(line)
+    assert lm, f"corrupted or split record at line {idx}: {line!r}"
+    batches_seen.add(int(lm.group(2)))
+
+assert 4 in batches_seen and 5 in batches_seen, f"expected surviving records from batches 4 and 5, got {batches_seen}"
+PYEOF
 
 # 4e) Daily recovery must NOT truncate pending firewall logs even when MAX_RAM_KB=1
 FW_RECOVERY_DIR="${TMP_ROOT}/jffs/fw-recovery-logs"

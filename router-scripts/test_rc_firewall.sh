@@ -2,12 +2,13 @@
 # Automated tests for router-scripts/rc_firewall.sh using a stateful mock iptables binary:
 #  1) Unsupported kernel (nfnetlink_log absent) leaves all chains untouched
 #  2) Failed iptables -j NFLOG probe leaves all chains untouched and cleans up probe chain
-#  3) Install preserves custom rules — including a filtered custom LOG rule sharing a stock prefix
-#     ("DROP ") and custom NFLOG rules — deactivates unfiltered stock LOG rules, is idempotent,
-#     and never flushes live chains
-#  4) Rollback restores the exact pre-install ordered rules across all chains
-#  5) Mid-run interruption preserves custom rules, filters, positions, and terminal verdicts,
-#     and subsequent rollback restores the exact pre-install ordered rules across all chains
+#  3) Unwritable BACKUP_FILE aborts before deleting any stock LOG rule; rollback preserves exact chains
+#  4) Install preserves custom rules — including filtered custom LOG rules sharing a stock prefix,
+#     interleaved custom rules after stock LOG rules, and duplicate stock LOG rule instances —
+#     deactivates unfiltered stock LOG rules, is idempotent, and never flushes live chains
+#  5) Rollback restores the exact pre-install ordered rules (including duplicate stock LOG rules)
+#  6) Rebuilt chains without reboot reconcile BACKUP_FILE cleanly
+#  7) Mid-run interruption (plus retry or immediate rollback) preserves and restores exact ordered rules
 
 set -eu
 
@@ -15,7 +16,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 FW_SCRIPT="${SCRIPT_DIR}/rc_firewall.sh"
 
 TMP_ROOT=$(mktemp -d)
-trap 'rm -rf "$TMP_ROOT"' EXIT
+trap 'chmod -R u+w "$TMP_ROOT" 2>/dev/null || true; rm -rf "$TMP_ROOT"' EXIT
 
 STATE_FILE="${TMP_ROOT}/iptables-state.json"
 BACKUP_FILE="${TMP_ROOT}/rc_firewall.backup"
@@ -248,6 +249,7 @@ init_state() {
       {"target": "ACCEPT", "spec": ["-s", "192.168.1.50", "-j", "ACCEPT"]},
       {"target": "LOG", "spec": ["-m", "state", "--state", "NEW", "-j", "LOG", "--log-prefix", "DROP "]},
       {"target": "LOG", "spec": ["-s", "192.168.1.77", "-j", "LOG", "--log-prefix", "DROP "]},
+      {"target": "LOG", "spec": ["-m", "state", "--state", "NEW", "-j", "LOG", "--log-prefix", "DROP "]},
       {"target": "ACCEPT", "spec": ["-s", "192.168.1.60", "-j", "ACCEPT"]},
       {"target": "LOG", "spec": ["-s", "192.168.1.88", "-j", "LOG", "--log-prefix", "CUSTOM_AUDIT "]},
       {"target": "LOG", "spec": ["-m", "state", "--state", "INVALID", "-j", "LOG", "--log-prefix", "DROP "]},
@@ -282,6 +284,10 @@ printf ' 2 NONE\n' > "$PROC_NO_NFLOG"
 PROC_OK="${TMP_ROOT}/nf_log_enabled"
 printf ' 2 nfnetlink_log (nfnetlink_log)\n' > "$PROC_OK"
 
+init_state
+ORIG_CHAINS="${TMP_ROOT}/orig-chains.json"
+python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["chains"], indent=2))' "$STATE_FILE" > "$ORIG_CHAINS"
+
 # --- Test 1: Missing nfnetlink_log aborts without modifying chains ---
 init_state
 BEFORE=$(cat "$STATE_FILE")
@@ -305,14 +311,28 @@ import json, sys
 s = json.loads(open(sys.argv[1]).read())
 assert not any(k.startswith("nflog_probe_") for k in s["chains"]), f"probe chain leaked: {list(s['chains'])}"
 assert s["meta"]["flushed_live"] == [], f"live chains flushed: {s['meta']['flushed_live']}"
-assert len(s["chains"]["logdrop"]) == 7, f"logdrop mutated on failed probe: {s['chains']['logdrop']}"
+assert len(s["chains"]["logdrop"]) == 8, f"logdrop mutated on failed probe: {s['chains']['logdrop']}"
 PYEOF
 
-# --- Test 3: Install + idempotent re-run preserve filtered custom LOG rules sharing stock prefixes ---
+# --- Test 2b: Unwritable BACKUP_FILE aborts before deleting any stock LOG rule; rollback preserves exact chains ---
 init_state
-ORIG_CHAINS="${TMP_ROOT}/orig-chains.json"
-python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["chains"], indent=2))' "$STATE_FILE" > "$ORIG_CHAINS"
+UNWRITABLE_BKP="${TMP_ROOT}/no-such-dir/rc_firewall.backup"
+if IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
+   BACKUP_FILE="$UNWRITABLE_BKP" SLEEP_SEC=0 SKIP_DAEMON=1 sh "$FW_SCRIPT" 2>/dev/null; then
+  echo "FAIL: expected rc_firewall.sh to fail when BACKUP_FILE path is unwritable" >&2
+  exit 1
+fi
+IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
+  BACKUP_FILE="$UNWRITABLE_BKP" SLEEP_SEC=0 SKIP_DAEMON=1 sh "$FW_SCRIPT" rollback
+python3 - "$STATE_FILE" "$ORIG_CHAINS" <<'PYEOF'
+import json, sys
+after = json.loads(open(sys.argv[1]).read())["chains"]
+orig = json.loads(open(sys.argv[2]).read())
+assert after == orig, f"Ordered rules after unwritable backup + rollback differ from pre-install!\nAfter: {json.dumps(after, indent=2)}\nOrig:  {json.dumps(orig, indent=2)}"
+PYEOF
 
+# --- Test 3: Install + idempotent re-run preserve filtered custom LOG rules & duplicate stock rule tracking ---
+init_state
 IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
   BACKUP_FILE="$BACKUP_FILE" SLEEP_SEC=0 SKIP_DAEMON=1 sh "$FW_SCRIPT"
 # Re-run to verify idempotency
@@ -325,7 +345,6 @@ s = json.loads(open(sys.argv[1]).read())
 c = s["chains"]
 assert s["meta"]["flushed_live"] == [], f"live chains must never be flushed: {s['meta']['flushed_live']}"
 
-# Unfiltered stock LOG rules must be removed, while filtered custom LOG rules sharing stock prefixes survive in position!
 assert c["logaccept"][0]["spec"] == ["-s", "192.168.1.250", "-j", "RETURN"]
 assert c["logaccept"][1]["spec"] == ["-p", "tcp", "--dport", "8443", "-j", "LOG", "--log-prefix", "ACCEPT "]
 assert c["logaccept"][2]["spec"] == ["-m", "state", "--state", "NEW", "-j", "NFLOG", "--nflog-group", "1", "--nflog-prefix", "ACCEPT "]
@@ -341,13 +360,12 @@ assert c["logdrop"][5]["spec"] == ["-m", "state", "--state", "INVALID", "-j", "N
 assert c["logdrop"][6]["spec"] == ["-j", "DROP"]
 assert len(c["logdrop"]) == 7
 
-# logbrute: custom group-99 NFLOG stays untouched at index 0, telemetry group-2 NFLOG replaces stock LOG at index 1
 assert c["logbrute"][0]["spec"] == ["-s", "10.0.0.0/8", "-j", "NFLOG", "--nflog-group", "99", "--nflog-prefix", "CUSTOM_TAP "]
 assert c["logbrute"][1]["spec"] == ["-j", "NFLOG", "--nflog-group", "2", "--nflog-prefix", "[DROP BRUTEFORCE] : "]
 assert c["logbrute"][2]["spec"] == ["-j", "DROP"]
 PYEOF
 
-# --- Test 4: Rollback restores exact ordered rules across ALL chains ---
+# --- Test 4: Rollback restores exact ordered rules (including BOTH duplicate NEW stock LOG rules) ---
 IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
   BACKUP_FILE="$BACKUP_FILE" SLEEP_SEC=0 SKIP_DAEMON=1 sh "$FW_SCRIPT" rollback
 
@@ -362,11 +380,9 @@ PYEOF
 init_state
 IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
   BACKUP_FILE="$BACKUP_FILE" SLEEP_SEC=0 SKIP_DAEMON=1 sh "$FW_SCRIPT"
-# Simulate DD-WRT rebuilding stock chains without rebooting (BACKUP_FILE remains in /tmp)
 SAVED_BKP=$(cat "$BACKUP_FILE")
 init_state
 printf '%s\n' "$SAVED_BKP" > "$BACKUP_FILE"
-# Re-run rc_firewall.sh after chain rebuild, then rollback
 IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
   BACKUP_FILE="$BACKUP_FILE" SLEEP_SEC=0 SKIP_DAEMON=1 sh "$FW_SCRIPT"
 IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
@@ -379,45 +395,41 @@ orig = json.loads(open(sys.argv[2]).read())
 assert after == orig, f"Ordered rules after chain rebuild + install + rollback differ from pre-install!\nAfter: {json.dumps(after, indent=2)}\nOrig:  {json.dumps(orig, indent=2)}"
 PYEOF
 
-# --- Test 5: Mid-run interruption preserves custom rules & positions, and rollback restores exact pre-install rules ---
-init_state
-if IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
-   BACKUP_FILE="$BACKUP_FILE" MOCK_IPT_FAIL_AFTER=5 SLEEP_SEC=0 SKIP_DAEMON=1 sh "$FW_SCRIPT" 2>/dev/null; then
-  echo "FAIL: expected simulated mid-run interruption to exit non-zero" >&2
-  exit 1
-fi
+# --- Test 5: Mid-run interruption (between deleting duplicate stock rules) + rollback AND retry + rollback ---
+for FAIL_STEP in 3 5 6; do
+  init_state
+  if IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
+     BACKUP_FILE="$BACKUP_FILE" MOCK_IPT_FAIL_AFTER="$FAIL_STEP" SLEEP_SEC=0 SKIP_DAEMON=1 sh "$FW_SCRIPT" 2>/dev/null; then
+    echo "FAIL: expected simulated mid-run interruption at step $FAIL_STEP to exit non-zero" >&2
+    exit 1
+  fi
 
-python3 - "$STATE_FILE" <<'PYEOF'
-import json, sys
-s = json.loads(open(sys.argv[1]).read())
-c = s["chains"]
-assert s["meta"]["flushed_live"] == [], f"live chains flushed before interruption: {s['meta']['flushed_live']}"
-# Custom rules, their filters, and their positions must survive at the moment of interruption
-assert c["logaccept"][0]["spec"] == ["-s", "192.168.1.250", "-j", "RETURN"]
-assert c["logaccept"][1]["spec"] == ["-p", "tcp", "--dport", "8443", "-j", "LOG", "--log-prefix", "ACCEPT "]
-assert c["logaccept"][-1]["target"] == "ACCEPT"
-assert c["logdrop"][0]["spec"] == ["-s", "192.168.1.50", "-j", "ACCEPT"]
-assert c["logdrop"][-1]["target"] == "DROP"
-assert any(r["spec"] == ["-s", "192.168.1.77", "-j", "LOG", "--log-prefix", "DROP "] for r in c["logdrop"])
-assert any(r["spec"] == ["-s", "192.168.1.60", "-j", "ACCEPT"] for r in c["logdrop"])
-assert any(r["spec"] == ["-s", "192.168.1.88", "-j", "LOG", "--log-prefix", "CUSTOM_AUDIT "] for r in c["logdrop"])
-assert c["logreject"][-1]["target"] == "REJECT"
-assert c["logreject_tcp"][-1]["target"] == "REJECT"
-assert c["portscan"][0]["spec"] == ["-s", "192.168.1.99", "-j", "RETURN"]
-assert c["portscan"][-1]["target"] == "logdrop"
-assert c["logbrute"][0]["spec"] == ["-s", "10.0.0.0/8", "-j", "NFLOG", "--nflog-group", "99", "--nflog-prefix", "CUSTOM_TAP "]
-assert c["logbrute"][-1]["target"] == "DROP"
-PYEOF
+  # Rollback immediately after interruption must restore exact ordered chains
+  IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
+    BACKUP_FILE="$BACKUP_FILE" SLEEP_SEC=0 SKIP_DAEMON=1 sh "$FW_SCRIPT" rollback
 
-# Now run rollback after the interrupted install and verify exact restoration of all ordered rules
-IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
-  BACKUP_FILE="$BACKUP_FILE" SLEEP_SEC=0 SKIP_DAEMON=1 sh "$FW_SCRIPT" rollback
-
-python3 - "$STATE_FILE" "$ORIG_CHAINS" <<'PYEOF'
+  python3 - "$STATE_FILE" "$ORIG_CHAINS" <<'PYEOF'
 import json, sys
 after = json.loads(open(sys.argv[1]).read())["chains"]
 orig = json.loads(open(sys.argv[2]).read())
 assert after == orig, f"Ordered rules after interrupted install + rollback differ from pre-install!\nAfter: {json.dumps(after, indent=2)}\nOrig:  {json.dumps(orig, indent=2)}"
 PYEOF
 
-echo "PASS: rc_firewall.sh verified (NFLOG precheck, filtered custom LOG sharing stock prefix preserved, exact ordered rollback after normal and interrupted install)"
+  # Also test: interrupted install -> retry install to completion -> rollback
+  init_state
+  IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
+    BACKUP_FILE="$BACKUP_FILE" MOCK_IPT_FAIL_AFTER="$FAIL_STEP" SLEEP_SEC=0 SKIP_DAEMON=1 sh "$FW_SCRIPT" 2>/dev/null || true
+  IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
+    BACKUP_FILE="$BACKUP_FILE" SLEEP_SEC=0 SKIP_DAEMON=1 sh "$FW_SCRIPT"
+  IPTABLES_BIN="$MOCK_IPT" MOCK_IPT_STATE="$STATE_FILE" NF_LOG_PROC="$PROC_OK" \
+    BACKUP_FILE="$BACKUP_FILE" SLEEP_SEC=0 SKIP_DAEMON=1 sh "$FW_SCRIPT" rollback
+
+  python3 - "$STATE_FILE" "$ORIG_CHAINS" <<'PYEOF'
+import json, sys
+after = json.loads(open(sys.argv[1]).read())["chains"]
+orig = json.loads(open(sys.argv[2]).read())
+assert after == orig, f"Ordered rules after interrupted install + retry + rollback differ from pre-install!\nAfter: {json.dumps(after, indent=2)}\nOrig:  {json.dumps(orig, indent=2)}"
+PYEOF
+done
+
+echo "PASS: rc_firewall.sh verified (NFLOG precheck, unwritable backup guard, duplicate & interleaved rule preservation, exact ordered rollback across install/interruption/retry)"
