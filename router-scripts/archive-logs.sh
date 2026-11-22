@@ -182,11 +182,17 @@ rotate_dns_for_ramcheck() {
       else
         if [ -f "$PREV_BAK" ]; then
           mv -f "$PREV_BAK" "${DNS_LOG}.prev"
+        else
+          rm -f "${DNS_LOG}.prev"
         fi
         return 1
       fi
     else
-      rm -f "$PREV_BAK"
+      if [ -f "$PREV_BAK" ]; then
+        mv -f "$PREV_BAK" "${DNS_LOG}.prev"
+      else
+        rm -f "${DNS_LOG}.prev"
+      fi
       echo "archive-logs: failed to merge prior ${DNS_LOG}.rot into ${DNS_LOG}.prev; skipping rotation" >&2
       return 1
     fi

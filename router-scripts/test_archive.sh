@@ -326,7 +326,7 @@ for i in range(1, 25):
     print(f"Nov 22 04:01:{i:02d} dnsmasq[1]: query[A] orig-prev-{i:02d}.example.com from 192.168.1.10")
 ' > "${RAM_DNS}.prev"
 python3 -c '
-for i in range(1, 25):
+for i in range(1, 32):
     print(f"Nov 22 04:02:{i:02d} dnsmasq[1]: query[A] orig-rot-{i:02d}.example.com from 192.168.1.10")
 ' > "${RAM_DNS}.rot"
 python3 -c '
@@ -356,6 +356,23 @@ if ! cmp -s "${RAM_DNS}.rot" "$ORIG_ROT_SNAP"; then
 fi
 if ls "${RAM_DNS}.prev.cap."* >/dev/null 2>&1; then
   echo "FAIL: temporary trim cap file left behind after failure" >&2
+  exit 1
+fi
+
+# Also verify when only .rot existed (no prior .prev), failed trim removes newly created .prev so retry never duplicates .rot
+rm -f "${RAM_DNS}.prev"
+if LOG_DIR="$RAM_LOG_DIR" DNS_LOG="$RAM_DNS" JFFS_MOUNT="${TMP_ROOT}/no-jffs" \
+   AWK_BIN="$PARTIAL_AWK" GZIP_BIN=gzip SKIP_SIGNALS=1 MAX_RAM_KB=1 MAX_JFFS_PCT=100 \
+   sh "$ARCHIVE_SCRIPT" ramcheck 2>/dev/null; then
+  echo "FAIL: expected ramcheck to fail when trim helper fails on oversized .rot without prior .prev" >&2
+  exit 1
+fi
+if [ -e "${RAM_DNS}.prev" ]; then
+  echo "FAIL: failed trim left newly created dns.log.prev alongside dns.log.rot (would duplicate records)" >&2
+  exit 1
+fi
+if ! cmp -s "${RAM_DNS}.rot" "$ORIG_ROT_SNAP"; then
+  echo "FAIL: failed trim altered original dns.log.rot" >&2
   exit 1
 fi
 
