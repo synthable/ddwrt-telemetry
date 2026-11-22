@@ -10,6 +10,7 @@ import json
 import mimetypes
 import os
 import random
+import re
 import threading
 import time
 import urllib.error
@@ -35,6 +36,124 @@ DEFAULT_WAN_IFACE = os.environ.get("WAN_IFACE", "").strip()
 DEFAULT_TOKEN_FILE = os.environ.get(
     "ROUTER_TOKEN_FILE", str(Path.home() / ".ddwrt" / "nflogd.token")
 )
+
+
+def _env_non_negative_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+        return max(val, 0)
+    except ValueError:
+        return default
+
+
+DEFAULT_RETAIN_DAYS = _env_non_negative_int("RETAIN_DAYS", 30)
+DEFAULT_MAX_ARCHIVES = _env_non_negative_int("MAX_ARCHIVES", 0)
+
+MANAGED_ARCHIVE_RE = re.compile(r"^(fw-drop|fw-accept|syslog)-(\d{8})-(\d{6})\.log\.gz$")
+
+
+def parse_archive_entry(name: str) -> tuple[str, int] | None:
+    """Return (prefix, unix_ts) for a managed firewall/syslog archive filename, or None."""
+    m = MANAGED_ARCHIVE_RE.match(name)
+    if not m:
+        return None
+    try:
+        dt = datetime.strptime(f"{m.group(2)}-{m.group(3)}", "%Y%m%d-%H%M%S")
+    except ValueError:
+        return None
+    return m.group(1), int(dt.timestamp())
+
+
+def select_archives_to_download(
+    remote_names: list,
+    archives_dir: Path,
+    retain_days: int = DEFAULT_RETAIN_DAYS,
+    max_archives: int = DEFAULT_MAX_ARCHIVES,
+    now_ts: int | None = None,
+) -> list[str]:
+    """Select missing remote archives that satisfy retain_days and max_archives limits."""
+    now = int(time.time()) if now_ts is None else int(now_ts)
+    cutoff = now - retain_days * 86400 if retain_days > 0 else None
+
+    remote_set: set[str] = set()
+    by_prefix: dict[str, dict[str, int]] = {}
+
+    if archives_dir.is_dir():
+        for entry in archives_dir.iterdir():
+            if not entry.is_file():
+                continue
+            parsed = parse_archive_entry(entry.name)
+            if parsed is None:
+                continue
+            prefix, ts = parsed
+            if cutoff is not None and ts < cutoff:
+                continue
+            by_prefix.setdefault(prefix, {})[entry.name] = ts
+
+    for name in remote_names or []:
+        if not isinstance(name, str):
+            continue
+        base_name = Path(name).name
+        parsed = parse_archive_entry(base_name)
+        if parsed is None:
+            continue
+        prefix, ts = parsed
+        if cutoff is not None and ts < cutoff:
+            continue
+        remote_set.add(base_name)
+        by_prefix.setdefault(prefix, {})[base_name] = ts
+
+    to_download: list[str] = []
+    for items in by_prefix.values():
+        ordered = sorted(items.items(), key=lambda pair: (pair[1], pair[0]))
+        if max_archives > 0 and len(ordered) > max_archives:
+            ordered = ordered[-max_archives:]
+        for base_name, _ in ordered:
+            if base_name in remote_set and not (archives_dir / base_name).exists():
+                to_download.append(base_name)
+
+    return sorted(to_download)
+
+
+def prune_local_archives(
+    archives_dir: Path,
+    retain_days: int = DEFAULT_RETAIN_DAYS,
+    max_archives: int = DEFAULT_MAX_ARCHIVES,
+    now_ts: int | None = None,
+) -> list[str]:
+    """Prune expired or excess managed firewall archives while preserving unrelated files."""
+    if not archives_dir.is_dir():
+        return []
+    now = int(time.time()) if now_ts is None else int(now_ts)
+    cutoff = now - retain_days * 86400 if retain_days > 0 else None
+
+    deleted: list[str] = []
+    survivors: dict[str, list[tuple[int, Path]]] = {}
+    for entry in archives_dir.iterdir():
+        if not entry.is_file():
+            continue
+        parsed = parse_archive_entry(entry.name)
+        if parsed is None:
+            continue
+        prefix, ts = parsed
+        if cutoff is not None and ts < cutoff:
+            entry.unlink(missing_ok=True)
+            deleted.append(entry.name)
+        else:
+            survivors.setdefault(prefix, []).append((ts, entry))
+
+    if max_archives > 0:
+        for items in survivors.values():
+            items.sort(key=lambda pair: (pair[0], pair[1].name))
+            if len(items) > max_archives:
+                for _, entry in items[:-max_archives]:
+                    entry.unlink(missing_ok=True)
+                    deleted.append(entry.name)
+
+    return sorted(deleted)
 
 
 def generate_demo_firewall_data(
@@ -349,12 +468,19 @@ class FirewallStore:
         token_file: str = DEFAULT_TOKEN_FILE,
         router_name: str = DEFAULT_ROUTER_NAME,
         demo: bool = False,
+        retain_days: int = DEFAULT_RETAIN_DAYS,
+        max_archives: int = DEFAULT_MAX_ARCHIVES,
+        data_dir: Path | None = None,
         wan_iface: str = DEFAULT_WAN_IFACE,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.token_file = Path(token_file)
         self.router_name = router_name
         self.demo = demo
+        self.retain_days = max(int(retain_days), 0)
+        self.max_archives = max(int(max_archives), 0)
+        self.data_dir = Path(data_dir) if data_dir is not None else DATA_DIR
+        self.archives_dir = self.data_dir / "archives"
         self._wan_iface_override = wan_iface.strip()
         self.wan_iface = self._wan_iface_override or self._read_persisted_wan_iface() or "wan"
         self._lock = threading.RLock()
@@ -401,9 +527,8 @@ class FirewallStore:
             headers = {k.lower(): v for k, v in resp.headers.items()}
             return resp.read(), headers
 
-    @staticmethod
-    def _read_persisted_wan_iface() -> str:
-        path = DATA_DIR / "wan_iface.txt"
+    def _read_persisted_wan_iface(self) -> str:
+        path = self.data_dir / "wan_iface.txt"
         if not path.exists():
             return ""
         return path.read_text(encoding="utf-8", errors="replace").strip()
@@ -411,15 +536,15 @@ class FirewallStore:
     def reload_local(self) -> None:
         if self.demo:
             return
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        ARCHIVES_DIR.mkdir(parents=True, exist_ok=True)
-        conf_path = DATA_DIR / "dnsmasq.conf"
-        leases_path = DATA_DIR / "dnsmasq.leases"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.archives_dir.mkdir(parents=True, exist_ok=True)
+        conf_path = self.data_dir / "dnsmasq.conf"
+        leases_path = self.data_dir / "dnsmasq.leases"
         devices = parse_device_map(
             conf_path.read_text(encoding="utf-8", errors="replace") if conf_path.exists() else "",
             leases_path.read_text(encoding="utf-8", errors="replace") if leases_path.exists() else "",
         )
-        events, counters, sources = load_all_logs(DATA_DIR, wan_iface=self.wan_iface)
+        events, counters, sources = load_all_logs(self.data_dir, wan_iface=self.wan_iface)
         with self._lock:
             self.devices = devices
             self.events = events
@@ -437,7 +562,7 @@ class FirewallStore:
         new_ino = int(hdrs.get("x-file-inode", "0") or 0)
         rotated = hdrs.get("x-rotated") == "1"
 
-        local_path = DATA_DIR / local_name
+        local_path = self.data_dir / local_name
         if off == 0 or rotated or not local_path.exists():
             local_path.write_bytes(body)
         elif body:
@@ -460,35 +585,45 @@ class FirewallStore:
             self.syncing = True
 
         try:
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            ARCHIVES_DIR.mkdir(parents=True, exist_ok=True)
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            self.archives_dir.mkdir(parents=True, exist_ok=True)
 
             meta_bytes, _ = self._http_get("/api/meta", timeout=15)
             meta = json.loads(meta_bytes.decode("utf-8", errors="replace"))
 
             if meta.get("iptables"):
-                (DATA_DIR / "iptables.txt").write_text(meta["iptables"], encoding="utf-8")
+                (self.data_dir / "iptables.txt").write_text(meta["iptables"], encoding="utf-8")
             if meta.get("dnsmasq_conf"):
-                (DATA_DIR / "dnsmasq.conf").write_text(meta["dnsmasq_conf"], encoding="utf-8")
+                (self.data_dir / "dnsmasq.conf").write_text(meta["dnsmasq_conf"], encoding="utf-8")
             if meta.get("leases"):
-                (DATA_DIR / "dnsmasq.leases").write_text(meta["leases"], encoding="utf-8")
+                (self.data_dir / "dnsmasq.leases").write_text(meta["leases"], encoding="utf-8")
             detected_wan = str(meta.get("wan_iface") or "").strip()
             if detected_wan:
-                (DATA_DIR / "wan_iface.txt").write_text(detected_wan + "\n", encoding="utf-8")
+                (self.data_dir / "wan_iface.txt").write_text(detected_wan + "\n", encoding="utf-8")
                 if not self._wan_iface_override:
                     self.wan_iface = detected_wan
 
+            now_ts = int(time.time())
             new_archives = 0
-            for name in meta.get("archives", []):
-                if not ((name.startswith("syslog-") or name.startswith("fw-")) and name.endswith(".log.gz")):
-                    continue
-                dst = ARCHIVES_DIR / Path(name).name
-                if dst.exists():
-                    continue
-                q = urllib.parse.urlencode({"name": name})
+            for base_name in select_archives_to_download(
+                meta.get("archives") or [],
+                self.archives_dir,
+                retain_days=self.retain_days,
+                max_archives=self.max_archives,
+                now_ts=now_ts,
+            ):
+                dst = self.archives_dir / base_name
+                q = urllib.parse.urlencode({"name": base_name})
                 gz_bytes, _ = self._http_get(f"/api/archive?{q}", timeout=25)
                 dst.write_bytes(gz_bytes)
                 new_archives += 1
+
+            pruned = prune_local_archives(
+                self.archives_dir,
+                retain_days=self.retain_days,
+                max_archives=self.max_archives,
+                now_ts=now_ts,
+            )
 
             self._pull_tail_file("drop", "fw-drop.log")
             self._pull_tail_file("accept", "fw-accept.log", max_bytes=1_000_000)
@@ -503,6 +638,7 @@ class FirewallStore:
                     "last_sync_ts": self.last_sync_ts,
                     "total_events": len(self.events),
                     "new_archives": new_archives,
+                    "pruned_archives": len(pruned),
                     "sources": self.sources,
                 }
         except Exception as exc:
@@ -546,7 +682,7 @@ class FirewallStore:
                             payload = line[6:]
                             local_name = "fw-accept.log" if cur_event == "accept" else "fw-drop.log"
                             key = "accept" if cur_event == "accept" else "drop"
-                            with (DATA_DIR / local_name).open("a", encoding="utf-8") as fh:
+                            with (self.data_dir / local_name).open("a", encoding="utf-8") as fh:
                                 fh.write(payload + "\n")
                             off, ino = self._tail_state.get(key, (0, 0))
                             self._tail_state[key] = (off + len((payload + "\n").encode("utf-8")), ino)
@@ -837,6 +973,13 @@ def make_handler(store: FirewallStore) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="DD-WRT Router Firewall Log Dashboard (HTTP/SSE)")
     ap.add_argument("--bind", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
@@ -853,6 +996,18 @@ def main() -> None:
         default=DEFAULT_WAN_IFACE,
         help="WAN interface name for outbound/counter matching (default: router /api/meta or 'wan'; env: WAN_IFACE)",
     )
+    ap.add_argument(
+        "--retain-days",
+        type=_non_negative_int,
+        default=DEFAULT_RETAIN_DAYS,
+        help="Prune managed local archives older than N days (0 disables; env: RETAIN_DAYS, default: 30)",
+    )
+    ap.add_argument(
+        "--max-archives",
+        type=_non_negative_int,
+        default=DEFAULT_MAX_ARCHIVES,
+        help="Keep at most N newest managed local archives per prefix (0 disables; env: MAX_ARCHIVES, default: 0)",
+    )
     ap.add_argument("--no-initial-sync", action="store_true", help="Skip initial sync on startup")
     ap.add_argument("--demo", action="store_true", help="Run with synthetic demo data (no router required)")
     args = ap.parse_args()
@@ -862,6 +1017,8 @@ def main() -> None:
         args.token_file,
         router_name=args.router_name,
         demo=args.demo,
+        retain_days=args.retain_days,
+        max_archives=args.max_archives,
         wan_iface=args.wan_iface,
     )
     if args.demo:

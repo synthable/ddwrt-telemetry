@@ -2,7 +2,10 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -105,5 +108,62 @@ func TestParseDefaultRouteIface(t *testing.T) {
 				t.Fatalf("parseDefaultRouteIface(%q) = %q; want %q", tc.out, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestListArchivesReturnsEmptyJSONArrayWhenNoneExist(t *testing.T) {
+	emptyDir := t.TempDir()
+	missingDir := filepath.Join(emptyDir, "does-not-exist")
+
+	for _, dir := range []string{emptyDir, missingDir} {
+		got := listArchives(dir)
+		if got == nil {
+			t.Fatalf("listArchives(%q) returned nil slice; want non-nil empty slice", dir)
+		}
+		if len(got) != 0 {
+			t.Fatalf("listArchives(%q) = %v; want empty slice", dir, got)
+		}
+		raw, err := json.Marshal(map[string]any{"archives": got})
+		if err != nil {
+			t.Fatalf("json.Marshal failed: %v", err)
+		}
+		if string(raw) != `{"archives":[]}` {
+			t.Fatalf("marshaled JSON = %s; want {\"archives\":[]}", string(raw))
+		}
+	}
+}
+
+func TestListArchivesFiltersAndSortsValidNames(t *testing.T) {
+	dir := t.TempDir()
+	files := []string{
+		"fw-drop-20261121-035500.log.gz",
+		"dns-20261120-035500.log.gz",
+		"dns-20261121-035500.log.gz",
+		"notes.txt",
+		"dns-20261121-035500.log.gz.tmp",
+		"other-20261121-035500.log.gz",
+	}
+	for _, name := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(dir, "dns-20261122-035500.log.gz"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	got := listArchives(dir)
+	want := []string{
+		"dns-20261120-035500.log.gz",
+		"dns-20261121-035500.log.gz",
+		"fw-drop-20261121-035500.log.gz",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("listArchives() = %v; want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("listArchives()[%d] = %q; want %q", i, got[i], want[i])
+		}
 	}
 }
