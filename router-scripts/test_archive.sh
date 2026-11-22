@@ -148,4 +148,50 @@ case "$ACCEPT_CONTENT" in
     ;;
 esac
 
-echo "PASS: archive-logs.sh verified (failure preservation, corruption rejection, retry recovery)"
+# --- Test 4: Repeated ramcheck bounds RAM usage and archives overflow .prev ---
+RAM_LOG_DIR="${TMP_ROOT}/jffs/ramcheck-logs"
+RAM_DNS="${RAM_DIR}/ram-dns.log"
+mkdir -p "$RAM_LOG_DIR"
+
+python3 -c 'print("A" * 2048 + " ram-batch-1")' > "$RAM_DNS"
+LOG_DIR="$RAM_LOG_DIR" DNS_LOG="$RAM_DNS" JFFS_MOUNT="${TMP_ROOT}/no-jffs" \
+  GZIP_BIN=gzip SKIP_SIGNALS=1 MAX_RAM_KB=1 MAX_JFFS_PCT=100 \
+  sh "$ARCHIVE_SCRIPT" ramcheck
+
+[ -s "${RAM_DNS}.prev" ] || { echo "FAIL: first ramcheck did not rotate live DNS log to .prev" >&2; exit 1; }
+SIZE_AFTER_FIRST=$(wc -c < "${RAM_DNS}.prev" | tr -d ' ')
+
+python3 -c 'print("B" * 2048 + " ram-batch-2")' > "$RAM_DNS"
+LOG_DIR="$RAM_LOG_DIR" DNS_LOG="$RAM_DNS" JFFS_MOUNT="${TMP_ROOT}/no-jffs" \
+  GZIP_BIN=gzip SKIP_SIGNALS=1 MAX_RAM_KB=1 MAX_JFFS_PCT=100 \
+  sh "$ARCHIVE_SCRIPT" ramcheck
+
+SIZE_AFTER_SECOND=$(wc -c < "${RAM_DNS}.prev" | tr -d ' ')
+if [ "$SIZE_AFTER_SECOND" -gt "$SIZE_AFTER_FIRST" ]; then
+  echo "FAIL: ramcheck grew .prev unboundedly ($SIZE_AFTER_SECOND > $SIZE_AFTER_FIRST)" >&2
+  exit 1
+fi
+
+RAM_ARCH=$(ls "${RAM_LOG_DIR}"/dns-*.log.gz | head -n 1)
+gzip -t "$RAM_ARCH"
+case "$(gzip -dc "$RAM_ARCH")" in
+  *"ram-batch-1"*) ;;
+  *)
+    echo "FAIL: overflow ramcheck archive missing ram-batch-1" >&2
+    exit 1
+    ;;
+esac
+
+# Even if archival fails during ramcheck, .prev must stay bounded rather than accumulating
+python3 -c 'print("C" * 2048 + " ram-batch-3")' > "$RAM_DNS"
+LOG_DIR="$RAM_LOG_DIR" DNS_LOG="$RAM_DNS" JFFS_MOUNT="${TMP_ROOT}/no-jffs" \
+  GZIP_BIN="$FAIL_GZIP" SKIP_SIGNALS=1 MAX_RAM_KB=1 MAX_JFFS_PCT=100 \
+  sh "$ARCHIVE_SCRIPT" ramcheck 2>/dev/null
+
+SIZE_AFTER_THIRD=$(wc -c < "${RAM_DNS}.prev" | tr -d ' ')
+if [ "$SIZE_AFTER_THIRD" -gt "$SIZE_AFTER_FIRST" ]; then
+  echo "FAIL: ramcheck grew .prev on failed flush ($SIZE_AFTER_THIRD > $SIZE_AFTER_FIRST)" >&2
+  exit 1
+fi
+
+echo "PASS: archive-logs.sh verified (failure preservation, corruption rejection, retry recovery, bounded ramcheck)"

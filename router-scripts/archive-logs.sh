@@ -92,6 +92,30 @@ archive_files() {
   return 1
 }
 
+prune_archives() {
+  # Prune beyond MAX_KEEP per log type
+  for PREFIX in dns fw-drop fw-accept syslog; do
+    COUNT=$(ls -1 "${LOG_DIR}/${PREFIX}-"*.log.gz 2>/dev/null | wc -l)
+    if [ "$COUNT" -gt "$MAX_KEEP" ]; then
+      DEL=$((COUNT - MAX_KEEP))
+      ls -1 "${LOG_DIR}/${PREFIX}-"*.log.gz 2>/dev/null | head -n "$DEL" | while read -r F; do
+        rm -f "$F"
+      done
+    fi
+  done
+
+  # Hard /jffs capacity guard
+  if [ -d "$JFFS_MOUNT" ]; then
+    while true; do
+      PCT=$(df -k "$JFFS_MOUNT" 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
+      [ -z "$PCT" ] || [ "$PCT" -lt "$MAX_JFFS_PCT" ] && break
+      OLDEST=$(ls -1tr "${LOG_DIR}/"*.log.gz 2>/dev/null | head -n 1)
+      [ -z "$OLDEST" ] && break
+      rm -f "$OLDEST"
+    done
+  fi
+}
+
 case "$1" in
   ramcheck)
     ensure_nflogd
@@ -99,15 +123,17 @@ case "$1" in
       KB=$(du -k "$DNS_LOG" 2>/dev/null | awk '{print $1}')
       if [ -n "$KB" ] && [ "$KB" -ge "$MAX_RAM_KB" ]; then
         if [ -s "${DNS_LOG}.prev" ]; then
-          if mv "$DNS_LOG" "${DNS_LOG}.ramtmp" 2>/dev/null; then
-            reopen_dnsmasq
-            if cat "${DNS_LOG}.ramtmp" >> "${DNS_LOG}.prev"; then
-              rm -f "${DNS_LOG}.ramtmp"
-            fi
+          # Flush prior .prev to compressed archive if possible so RAM stays strictly bounded
+          TS=$(date +%Y%m%d-%H%M%S)
+          if mkdir -p "$LOG_DIR" 2>/dev/null && \
+             archive_files "${LOG_DIR}/dns-${TS}.log.gz" "${DNS_LOG}.prev"; then
+            rm -f "${DNS_LOG}.prev"
+            prune_archives
+          else
+            echo "archive-logs: ramcheck unable to archive ${DNS_LOG}.prev; replacing to enforce RAM cap" >&2
           fi
-        else
-          mv "$DNS_LOG" "${DNS_LOG}.prev" 2>/dev/null && reopen_dnsmasq
         fi
+        mv -f "$DNS_LOG" "${DNS_LOG}.prev" 2>/dev/null && reopen_dnsmasq
       fi
     fi
     exit 0
@@ -171,26 +197,7 @@ if [ -s "${SYSLOG_DIR}/messages.0" ] || [ -s "${SYSLOG_DIR}/messages" ]; then
   fi
 fi
 
-# 4. Prune beyond MAX_KEEP per log type
-for PREFIX in dns fw-drop fw-accept syslog; do
-  COUNT=$(ls -1 "${LOG_DIR}/${PREFIX}-"*.log.gz 2>/dev/null | wc -l)
-  if [ "$COUNT" -gt "$MAX_KEEP" ]; then
-    DEL=$((COUNT - MAX_KEEP))
-    ls -1 "${LOG_DIR}/${PREFIX}-"*.log.gz 2>/dev/null | head -n "$DEL" | while read -r F; do
-      rm -f "$F"
-    done
-  fi
-done
-
-# 5. Hard /jffs capacity guard
-if [ -d "$JFFS_MOUNT" ]; then
-  while true; do
-    PCT=$(df -k "$JFFS_MOUNT" 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
-    [ -z "$PCT" ] || [ "$PCT" -lt "$MAX_JFFS_PCT" ] && break
-    OLDEST=$(ls -1tr "${LOG_DIR}/"*.log.gz 2>/dev/null | head -n 1)
-    [ -z "$OLDEST" ] && break
-    rm -f "$OLDEST"
-  done
-fi
+# 4. Prune beyond MAX_KEEP and enforce /jffs capacity guard
+prune_archives
 
 exit "$FAILED"

@@ -66,6 +66,57 @@ def parse_archive_entry(name: str) -> tuple[str, int] | None:
     return m.group(1), int(dt.timestamp())
 
 
+def select_archives_to_download(
+    remote_names: list,
+    archives_dir: Path,
+    retain_days: int = DEFAULT_RETAIN_DAYS,
+    max_archives: int = DEFAULT_MAX_ARCHIVES,
+    now_ts: int | None = None,
+) -> list[str]:
+    """Select missing remote archives that satisfy retain_days and max_archives limits."""
+    now = int(time.time()) if now_ts is None else int(now_ts)
+    cutoff = now - retain_days * 86400 if retain_days > 0 else None
+
+    remote_set: set[str] = set()
+    by_prefix: dict[str, dict[str, int]] = {}
+
+    if archives_dir.is_dir():
+        for entry in archives_dir.iterdir():
+            if not entry.is_file():
+                continue
+            parsed = parse_archive_entry(entry.name)
+            if parsed is None:
+                continue
+            prefix, ts = parsed
+            if cutoff is not None and ts < cutoff:
+                continue
+            by_prefix.setdefault(prefix, {})[entry.name] = ts
+
+    for name in remote_names or []:
+        if not isinstance(name, str):
+            continue
+        base_name = Path(name).name
+        parsed = parse_archive_entry(base_name)
+        if parsed is None:
+            continue
+        prefix, ts = parsed
+        if cutoff is not None and ts < cutoff:
+            continue
+        remote_set.add(base_name)
+        by_prefix.setdefault(prefix, {})[base_name] = ts
+
+    to_download: list[str] = []
+    for items in by_prefix.values():
+        ordered = sorted(items.items(), key=lambda pair: (pair[1], pair[0]))
+        if max_archives > 0 and len(ordered) > max_archives:
+            ordered = ordered[-max_archives:]
+        for base_name, _ in ordered:
+            if base_name in remote_set and not (archives_dir / base_name).exists():
+                to_download.append(base_name)
+
+    return sorted(to_download)
+
+
 def prune_local_archives(
     archives_dir: Path,
     retain_days: int = DEFAULT_RETAIN_DAYS,
@@ -386,22 +437,17 @@ class DashboardStore:
             if meta.get("leases"):
                 (self.data_dir / "dnsmasq.leases").write_text(meta["leases"], encoding="utf-8")
 
-            # Download any new DNS archives within local retention policy
+            # Download any new DNS archives within local retention & count limits
             now_ts = int(time.time())
-            cutoff = now_ts - self.retain_days * 86400 if self.retain_days > 0 else None
             new_archives = 0
-            for name in meta.get("archives") or []:
-                if not isinstance(name, str):
-                    continue
-                base_name = Path(name).name
-                parsed = parse_archive_entry(base_name)
-                if parsed is None:
-                    continue
-                if cutoff is not None and parsed[1] < cutoff:
-                    continue
+            for base_name in select_archives_to_download(
+                meta.get("archives") or [],
+                self.archives_dir,
+                retain_days=self.retain_days,
+                max_archives=self.max_archives,
+                now_ts=now_ts,
+            ):
                 dst = self.archives_dir / base_name
-                if dst.exists():
-                    continue
                 q = urllib.parse.urlencode({"name": base_name})
                 gz_bytes, _ = self._http_get(f"/api/archive?{q}", timeout=25)
                 dst.write_bytes(gz_bytes)
