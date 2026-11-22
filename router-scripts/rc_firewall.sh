@@ -5,8 +5,10 @@
 #
 # Scope: Configures IPv4 iptables chains only (IPv6 ip6tables is not modified).
 # Safety: Checks kernel nfnetlink_log + iptables NFLOG support before modifying any chain,
-# preserves custom user rules and terminal verdicts without flushing live chains, replaces
-# stock DD-WRT LOG rules so dmesg/syslog stays clean, and supports safe removal via:
+# preserves custom user rules (including filtered custom LOG rules sharing a stock prefix)
+# and terminal verdicts without flushing live chains, records removed unfiltered stock
+# DD-WRT LOG rules so rollback restores the exact ordered rule set, and supports safe
+# removal via:
 #   rc_firewall.sh rollback
 
 IPTABLES_BIN="${IPTABLES_BIN:-iptables}"
@@ -14,6 +16,7 @@ NF_LOG_PROC="${NF_LOG_PROC:-/proc/net/netfilter/nf_log}"
 NFLOGD_BIN="${NFLOGD_BIN:-/jffs/bin/nflogd}"
 NFLOGD_LISTEN="${NFLOGD_LISTEN:-192.168.1.1:8789}"
 NFLOGD_TZ="${NFLOGD_TZ:-America/Los_Angeles}"
+BACKUP_FILE="${BACKUP_FILE:-/tmp/ddwrt-telemetry-rc_firewall.backup}"
 SLEEP_SEC="${SLEEP_SEC:-5}"
 SKIP_DAEMON="${SKIP_DAEMON:-0}"
 
@@ -45,22 +48,45 @@ chain_exists() {
   "$IPTABLES_BIN" -L "$1" -n >/dev/null 2>&1
 }
 
-# Find the last terminal verdict rule in a chain so NFLOG rules insert immediately
-# before it without disturbing custom rules above or ever dropping the verdict.
+# Find the last unconditional terminal verdict rule in a chain so telemetry rules insert
+# immediately before it without mistaking filtered custom rules for the terminal verdict.
 find_terminal_pos() {
   "$IPTABLES_BIN" -L "$1" -n --line-numbers 2>/dev/null | \
-    awk '$1 ~ /^[0-9]+$/ && ($2=="ACCEPT" || $2=="DROP" || $2=="REJECT" || $2=="logdrop") { pos=$1 } END { if (pos != "") print pos }'
+    awk '
+      $1 ~ /^[0-9]+$/ && ($2=="ACCEPT" || $2=="DROP" || $2=="REJECT" || $2=="logdrop") && $5=="0.0.0.0/0" && $6=="0.0.0.0/0" {
+        pos=$1
+      }
+      END { if (pos != "") print pos }
+    '
 }
 
-# Locate the first stock LOG rule in CHAIN matching the exact DD-WRT log prefix.
-find_stock_log_line() {
+# Locate the first unfiltered stock DD-WRT LOG rule in CHAIN matching the exact log prefix.
+# Returns "<line_num>|<state_kind>" where state_kind is NEW, INVALID, or NONE.
+# Never matches a custom LOG rule that specifies source/destination IPs, interfaces,
+# protocols, ports, or any match criteria other than stock -m state --state NEW|INVALID.
+find_stock_log_rule() {
   CHAIN="$1"
   PFX="$2"
   "$IPTABLES_BIN" -L "$CHAIN" -n --line-numbers 2>/dev/null | \
     awk -v pfx="$PFX" '
-      $1 ~ /^[0-9]+$/ && $2 == "LOG" && index($0, "prefix \"" pfx "\"") > 0 {
-        print $1
-        exit
+      $1 ~ /^[0-9]+$/ && $2 == "LOG" && $3 == "all" && $4 == "--" && $5 == "0.0.0.0/0" && $6 == "0.0.0.0/0" {
+        if (index($0, "prefix \"" pfx "\"") == 0) next
+        rest = $0
+        sub(/^[[:space:]]*[0-9]+[[:space:]]+LOG[[:space:]]+all[[:space:]]+--[[:space:]]+0\.0\.0\.0\/0[[:space:]]+0\.0\.0\.0\/0[[:space:]]*/, "", rest)
+        idx = index(rest, "LOG flags")
+        if (idx == 0) next
+        pre = substr(rest, 1, idx - 1)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", pre)
+        if (pre == "") {
+          print $1 "|NONE"
+          exit
+        } else if (pre == "state NEW" || pre == "-m state --state NEW") {
+          print $1 "|NEW"
+          exit
+        } else if (pre == "state INVALID" || pre == "-m state --state INVALID") {
+          print $1 "|INVALID"
+          exit
+        }
       }
     '
 }
@@ -72,7 +98,7 @@ find_nflog_line() {
   PFX="$3"
   "$IPTABLES_BIN" -L "$CHAIN" -n --line-numbers 2>/dev/null | \
     awk -v grp="$GRP" -v pfx="$PFX" '
-      $1 ~ /^[0-9]+$/ && $2 == "NFLOG" {
+      $1 ~ /^[0-9]+$/ && $2 == "NFLOG" && $3 == "all" && $5 == "0.0.0.0/0" && $6 == "0.0.0.0/0" {
         has_grp = ($0 ~ ("(nflog-group|--nflog-group)[[:space:]]+" grp "([^0-9]|$)"))
         has_pfx = (index($0, "\"" pfx "\"") > 0)
         if (has_grp && has_pfx) {
@@ -83,8 +109,8 @@ find_nflog_line() {
     '
 }
 
-# Insert an NFLOG rule idempotently before the chain's terminal verdict (never flushes chain).
-ensure_nflog_rule() {
+# Insert a rule idempotently before the chain's terminal verdict (never flushes chain).
+ensure_rule_before_terminal() {
   CHAIN="$1"
   shift
   chain_exists "$CHAIN" || return 0
@@ -99,15 +125,27 @@ ensure_nflog_rule() {
   fi
 }
 
-# Remove stock DD-WRT LOG rules matching the exact prefix so kernel syslog isn't flooded,
-# while preserving any custom LOG rules with other prefixes and all terminal verdicts.
+record_stock_log_backup() {
+  ENTRY="$1"
+  if [ -f "$BACKUP_FILE" ] && grep -Fqx "$ENTRY" "$BACKUP_FILE" 2>/dev/null; then
+    return 0
+  fi
+  printf '%s\n' "$ENTRY" >> "$BACKUP_FILE"
+}
+
+# Remove unfiltered stock DD-WRT LOG rules matching the exact prefix so kernel syslog isn't flooded,
+# recording each removed stock rule in BACKUP_FILE so rollback restores the exact original chain.
+# Custom LOG rules (even those sharing a stock prefix) are never matched or removed.
 remove_stock_log_rules() {
   CHAIN="$1"
   PFX="$2"
   chain_exists "$CHAIN" || return 0
   while true; do
-    N=$(find_stock_log_line "$CHAIN" "$PFX")
-    [ -n "$N" ] || break
+    FOUND=$(find_stock_log_rule "$CHAIN" "$PFX")
+    [ -n "$FOUND" ] || break
+    N=${FOUND%%|*}
+    KIND=${FOUND#*|}
+    record_stock_log_backup "${CHAIN}|${KIND}|${PFX}" || return 1
     "$IPTABLES_BIN" -D "$CHAIN" "$N" || return 1
   done
   return 0
@@ -124,8 +162,31 @@ remove_nflog_rule() {
   return 0
 }
 
+restore_saved_stock_logs() {
+  [ -f "$BACKUP_FILE" ] || return 0
+  RC_RESTORE=0
+  while IFS='|' read -r CHAIN KIND PFX; do
+    [ -n "$CHAIN" ] || continue
+    chain_exists "$CHAIN" || continue
+    case "$KIND" in
+      NEW)
+        ensure_rule_before_terminal "$CHAIN" -m state --state NEW -j LOG --log-prefix "$PFX" || RC_RESTORE=1
+        ;;
+      INVALID)
+        ensure_rule_before_terminal "$CHAIN" -m state --state INVALID -j LOG --log-prefix "$PFX" || RC_RESTORE=1
+        ;;
+      NONE)
+        ensure_rule_before_terminal "$CHAIN" -j LOG --log-prefix "$PFX" || RC_RESTORE=1
+        ;;
+    esac
+  done < "$BACKUP_FILE"
+  return "$RC_RESTORE"
+}
+
 rollback_rules() {
   RC=0
+  restore_saved_stock_logs || RC=1
+
   remove_nflog_rule logaccept -m state --state NEW -j NFLOG --nflog-group 1 --nflog-prefix "ACCEPT " || RC=1
   remove_nflog_rule logdrop -m state --state NEW -j NFLOG --nflog-group 2 --nflog-prefix "DROP " || RC=1
   remove_nflog_rule logdrop -m state --state INVALID -j NFLOG --nflog-group 2 --nflog-prefix "DROP " || RC=1
@@ -139,6 +200,8 @@ rollback_rules() {
       "$IPTABLES_BIN" -R logbrute "$N" -j LOG --log-prefix "[DROP BRUTEFORCE] : " || RC=1
     fi
   fi
+
+  [ "$RC" -eq 0 ] && rm -f "$BACKUP_FILE"
   return "$RC"
 }
 
@@ -166,26 +229,27 @@ if [ "$SKIP_DAEMON" != "1" ]; then
 fi
 
 # Apply NFLOG rules in-place without flushing chains or removing custom/terminal rules,
-# then remove stock DD-WRT LOG rules for each chain so dmesg/syslog stays clean.
-ensure_nflog_rule logaccept -m state --state NEW -j NFLOG --nflog-group 1 --nflog-prefix "ACCEPT " || exit 1
+# then record and remove unfiltered stock DD-WRT LOG rules so dmesg/syslog stays clean.
+ensure_rule_before_terminal logaccept -m state --state NEW -j NFLOG --nflog-group 1 --nflog-prefix "ACCEPT " || exit 1
 remove_stock_log_rules logaccept "ACCEPT " || exit 1
 
-ensure_nflog_rule logdrop -m state --state NEW -j NFLOG --nflog-group 2 --nflog-prefix "DROP " || exit 1
-ensure_nflog_rule logdrop -m state --state INVALID -j NFLOG --nflog-group 2 --nflog-prefix "DROP " || exit 1
+ensure_rule_before_terminal logdrop -m state --state NEW -j NFLOG --nflog-group 2 --nflog-prefix "DROP " || exit 1
+ensure_rule_before_terminal logdrop -m state --state INVALID -j NFLOG --nflog-group 2 --nflog-prefix "DROP " || exit 1
 remove_stock_log_rules logdrop "DROP " || exit 1
 
-ensure_nflog_rule logreject -j NFLOG --nflog-group 2 --nflog-prefix "REJECT " || exit 1
+ensure_rule_before_terminal logreject -j NFLOG --nflog-group 2 --nflog-prefix "REJECT " || exit 1
 remove_stock_log_rules logreject "REJECT " || exit 1
 
-ensure_nflog_rule logreject_tcp -j NFLOG --nflog-group 2 --nflog-prefix "REJECT " || exit 1
+ensure_rule_before_terminal logreject_tcp -j NFLOG --nflog-group 2 --nflog-prefix "REJECT " || exit 1
 remove_stock_log_rules logreject_tcp "REJECT " || exit 1
 
-ensure_nflog_rule portscan -j NFLOG --nflog-group 2 --nflog-prefix "portscan:" || exit 1
+ensure_rule_before_terminal portscan -j NFLOG --nflog-group 2 --nflog-prefix "portscan:" || exit 1
 remove_stock_log_rules portscan "portscan:" || exit 1
 
 if chain_exists logbrute; then
   if [ -z "$(find_nflog_line logbrute 2 "[DROP BRUTEFORCE] : ")" ]; then
-    N=$(find_stock_log_line logbrute "[DROP BRUTEFORCE] : ")
+    FOUND=$(find_stock_log_rule logbrute "[DROP BRUTEFORCE] : ")
+    N=${FOUND%%|*}
     if [ -n "$N" ]; then
       "$IPTABLES_BIN" -R logbrute "$N" -j NFLOG --nflog-group 2 --nflog-prefix "[DROP BRUTEFORCE] : " || exit 1
     fi
