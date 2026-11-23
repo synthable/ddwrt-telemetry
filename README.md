@@ -118,6 +118,11 @@ sequenceDiagram
   D->>N: On wake/reconnect: /api/meta + /api/archive + /api/tail catch-up
 ```
 
+**Hourly DNS RAM Guard & Overflow Policy (`archive-logs.sh ramcheck`)**:
+- When live `/tmp/dns.log` reaches `MAX_RAM_KB` (default `16384` KB), the first threshold crossing rotates it in RAM to `/tmp/dns.log.prev` and signals `dnsmasq` (`SIGUSR2`).
+- If `/tmp/dns.log` reaches `MAX_RAM_KB` again before daily archival, `ramcheck` rotates it to `/tmp/dns.log.rot` and archives `.prev` + `.rot` to `/jffs/logs/dns-YYYYMMDD-HHMMSS.log.gz` (verified with `gzip -t`). If the archive write fails, both `.prev` and `.rot` are preserved and `ramcheck` exits non-zero (`1`).
+- If archive writes fail repeatedly across additional rotations and `/tmp/dns.log.prev` exceeds `2 * MAX_RAM_KB`, the oldest complete log lines are evicted on newline boundaries (never splitting a record), and the exact cumulative loss is emitted on `stderr` and recorded in an in-band `# archive-logs: RAM_CAP_OVERFLOW discarded_records=<N> discarded_bytes=<B> max_prev_bytes=<M>` header line preserved at the top of the recovered archive.
+
 ---
 
 ## Features
